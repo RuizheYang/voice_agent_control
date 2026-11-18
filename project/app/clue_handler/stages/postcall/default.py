@@ -29,14 +29,13 @@ def extract_conversation_messages(context_list: Any) -> List[Dict[str, str]]:
         role = "assistant" if sender in ("robot", "assistant") else "user"
         content = item.get("text") or item.get("content") or ""
         content_str = str(content).strip()
-        # 过滤控制指令和空内容
-        if content_str and not content_str.startswith("Call the wecomServer"):
+        if content_str and not content_str.startswith("Call the "):
             messages.append({"role": role, "content": content_str})
     return messages
 
 
 class DefaultPostCallHandler(BasePostCallHandler):
-    """外呼结束后的总结与流转处理器 (默认通用实现)"""
+    """外呼结束后的 Agent 评估决策与流转处理器"""
 
     def __init__(
         self,
@@ -165,108 +164,34 @@ class DefaultPostCallHandler(BasePostCallHandler):
                     raw_context = []
             messages = extract_conversation_messages(raw_context or [])
 
-            # 2. 调用总结引擎分析对话 (优先使用 analyze_call，兼容 analyze_conversation)
-            summary_results: Dict[str, Any] = {}
-            summary_decision: Optional[str] = None
+            # 2. 话后基础事实与报告解析（统一交由 AgentDrivenStrategyEngine 执行深度业务分析与排期）
+            common_events: Dict[str, Any] = {}
             summary_reason: Optional[str] = None
+            if latest_call and getattr(latest_call, "common_call_events", None) and isinstance(latest_call.common_call_events, dict):
+                common_events = dict(latest_call.common_call_events)
 
-            if self.summary_engine:
-                try:
-                    import inspect
-                    from app.utils.time_utils import get_now
-                    ref_time = get_now().isoformat()
-
-                    # (1) 定制 prompt 获取：优先取通话快照中可能覆盖的场景 prompt，兜底取策略绑定的 self.summary_prompt
-                    active_prompt = self.summary_prompt
-                    if latest_call and getattr(latest_call, "config_snapshot", None) and isinstance(latest_call.config_snapshot, dict):
-                        custom_prompt = (
-                            latest_call.config_snapshot.get("summary_prompt")
-                            or latest_call.config_snapshot.get("summaryPrompt")
-                        )
-                        if custom_prompt and isinstance(custom_prompt, str) and custom_prompt.strip():
-                            active_prompt = custom_prompt.strip()
-
-                    target_summary_type = self.summary_type or "single_call"
-
-                    # (2) 优先调用 analyze_call (新版三阶段总结入口)
-                    call_fn = getattr(self.summary_engine, "analyze_call", None)
-                    if call_fn is not None and inspect.iscoroutinefunction(call_fn):
-                        context_str = raw_context if isinstance(raw_context, str) else json.dumps(raw_context or messages, ensure_ascii=False)
-                        result_code = "00000"
-                        if latest_call and isinstance(latest_call.config_snapshot, dict):
-                            result_code = latest_call.config_snapshot.get("resultCode") or "00000"
-
-                        call_info = {
-                            "data": {
-                                "currentCall": {
-                                    "resultCode": result_code,
-                                    "aiCallContextList": context_str,
-                                }
-                            }
-                        }
-                        call_res = await self.summary_engine.analyze_call(
-                            call_info=call_info,
-                            summary_type=target_summary_type,
-                            summary_prompt=active_prompt,
-                            reference_time=ref_time,
-                        )
-                        if hasattr(call_res, "model_dump"):
-                            summary_results = call_res.model_dump(mode="json")
-                        elif isinstance(call_res, dict):
-                            summary_results = call_res
-                        else:
-                            summary_results = {}
-
-                        summary_decision = summary_results.get("decision")
-                        summary_reason = summary_results.get("reason")
-                        logger.info(
-                            f"[PostCallHandler] clue_id={clue_id} analyze_call 总结引擎调用成功: "
-                            f"decision={summary_decision}, reason={summary_reason}"
-                        )
-                    elif hasattr(self.summary_engine, "analyze_conversation") and messages:
-                        sig = inspect.signature(self.summary_engine.analyze_conversation)
-                        call_kwargs = {"reference_time": ref_time}
-                        has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-
-                        if self.summary_type and ("summary_type" in sig.parameters or has_kwargs):
-                            call_kwargs["summary_type"] = self.summary_type
-                        if active_prompt and ("summary_prompt" in sig.parameters or has_kwargs):
-                            call_kwargs["summary_prompt"] = active_prompt
-
-                        summary_results = await self.summary_engine.analyze_conversation(
-                            conversation=messages,
-                            **call_kwargs
-                        )
-                        logger.info(
-                            f"[PostCallHandler] clue_id={clue_id} analyze_conversation 调用成功: {list(summary_results.keys())}"
-                        )
-                except Exception as sum_err:
-                    logger.warning(f"[PostCallHandler] clue_id={clue_id} 总结引擎调用异常 (降级使用兜底): {sum_err}")
-
-            # 3. 解析总结结论与是否真正打通判定
-            raw_common = summary_results.get("common_call_events") if isinstance(summary_results, dict) else None
-            common_events = raw_common if isinstance(raw_common, dict) else {}
-            if not common_events and latest_call and getattr(latest_call, "common_call_events", None):
-                if isinstance(latest_call.common_call_events, dict):
-                    common_events = latest_call.common_call_events
+            if isinstance(end_call_info, CallEndRequest) and end_call_info.data.outboundReport:
+                report_data = end_call_info.data.outboundReport.model_dump(exclude_none=True)
+                if report_data.get("conversationSummary") and not common_events.get("call_summary"):
+                    common_events["call_summary"] = report_data["conversationSummary"]
+                    summary_reason = str(report_data["conversationSummary"])
+                if report_data.get("nextCallTime") and not common_events.get("next_call_time"):
+                    common_events["has_next_call_appointment"] = "yes"
+                    common_events["next_call_time"] = str(report_data["nextCallTime"])
+                if report_data.get("wechatRequested") is not None:
+                    common_events["wechat_requested"] = bool(report_data["wechatRequested"])
 
             is_voicemail = (common_events.get("is_voicemail") == "yes") if common_events else False
             call_summary = common_events.get("call_summary") or summary_reason or ""
 
-            # 核心业务判定：结合决策结论与兜底话务标志
             answered_flag = latest_call.answered if latest_call else None
-            if summary_decision == "success":
-                is_connected = True
-            elif summary_decision in ("reject", "schedule"):
-                is_connected = False
-            elif answered_flag == 1 and not is_voicemail:
+            if answered_flag == 1 and not is_voicemail:
                 is_connected = True
             elif len(messages) >= 2 and not is_voicemail:
                 is_connected = True
             else:
                 is_connected = False
 
-            # 持久化总结结论至 CallRecord
             if latest_call:
                 latest_call.common_call_events = common_events or (
                     {"is_voicemail": "no", "call_summary": "未接通"} if not is_connected else {}
@@ -305,13 +230,12 @@ class DefaultPostCallHandler(BasePostCallHandler):
                 from app.strategy.contracts import ClueContext
                 from app.dbmodels.models import ClueInfo, OutboundStrategy
                 from app.observability.events_bus import event_bus, ClueEndEvent
-                from app.strategy.single_call.engine import SingleCallStrategyEngine
                 from app.utils.time_utils import get_now
 
                 clue = await ClueInfo.filter(clue_id=clue_id).first()
                 strategy_id = clue.strategy_id if clue and clue.strategy_id else "default"
                 strategy = await OutboundStrategy.filter(strategy_id=strategy_id).first()
-                schedule_id = strategy.schedule_id if strategy and strategy.schedule_id else "seven_day_three_call"
+                schedule_id = strategy.schedule_id if strategy and strategy.schedule_id else "agent_driven"
 
                 if self.strategy_engine is not None:
                     engine = self.strategy_engine
@@ -326,7 +250,7 @@ class DefaultPostCallHandler(BasePostCallHandler):
                     except Exception:
                         pass
 
-                # 若 Summary 提取到客户预约时间，传入上下文供排期策略推演
+                # 若外部报告或记录包含客户预约时间，传入上下文供 Agent 排期推演
                 if common_events and common_events.get("has_next_call_appointment") == "yes" and common_events.get("next_call_time"):
                     try:
                         from datetime import datetime
@@ -336,77 +260,19 @@ class DefaultPostCallHandler(BasePostCallHandler):
                     except Exception as parse_err:
                         logger.debug(f"[PostCallHandler] 解析客户预约时间失败: {parse_err}")
 
-                # 5. 动作与意图检测：判断是否触发加微或短信等动作
+                # 5. 动作与意图检测：判断是否触发后续渠道动作
                 has_pending_action = False
                 if common_events and (
                     common_events.get("wechat_requested") in (True, "yes", 1)
                     or common_events.get("action") in ("wechat", "sms", "add_wechat")
                 ):
                     has_pending_action = True
-                elif summary_results and isinstance(summary_results, dict):
-                    biz = summary_results.get("business_result") or {}
-                    if biz.get("action") in ("wechat", "sms", "add_wechat") or summary_results.get("action") in ("wechat", "sms"):
-                        has_pending_action = True
                 if not has_pending_action and isinstance(end_call_info, CallEndRequest):
                     outbound_report = end_call_info.data.outboundReport
                     if outbound_report and (getattr(outbound_report, "wechatRequested", False) or getattr(outbound_report, "wechat_requested", False)):
                         has_pending_action = True
 
-                # 6. 单通策略专属语义控制：只要打通一通就算，就结束线索 (由 Summary 告知)
-                is_single_call = isinstance(engine, SingleCallStrategyEngine) or (schedule_id == "single_call")
-
-                if is_single_call and is_connected:
-                    if has_pending_action:
-                        await crud.update_clue_state_or_raise(clue_id, ClueState.PENDING.value)
-                        logger.info(f"[PostCallHandler] 单通外呼已连通并触发加微/短信动作，状态流转为 PENDING: clue_id={clue_id}")
-                        return True
-
-                    terminal_state = ClueState.ACCEPTED.value
-                    end_code = 200
-                    close_reason = summary_reason or "单通外呼已打通结案"
-                    await crud.update_clue_state_or_raise(clue_id, terminal_state)
-                    await crud.save_close_reason(clue_id, close_reason)
-                    logger.info(f"[PostCallHandler] 单通外呼已真正连通，线索达成目标直接结案: clue_id={clue_id}")
-
-                    try:
-                        workflow_id = clue.workflow_id if clue else None
-                        await event_bus.emit(ClueEndEvent(
-                            clue_id=clue_id,
-                            workflow_id=workflow_id,
-                            event_data={
-                                "code": end_code,
-                                "reason": close_reason,
-                            }
-                        ))
-                    except Exception as end_err:
-                        logger.warning(f"[PostCallHandler] 触发 clue_ended 回推异常: {end_err}")
-
-                    return True
-
-                elif is_single_call and summary_decision == "reject":
-                    terminal_state = ClueState.REJECTED.value
-                    end_code = 300
-                    close_reason = summary_reason or "用户明确拒绝再联系，单通跟进终止"
-                    await crud.update_clue_state_or_raise(clue_id, terminal_state)
-                    await crud.save_close_reason(clue_id, close_reason)
-                    logger.info(f"[PostCallHandler] 单通外呼用户明确拒绝，线索结案终止: clue_id={clue_id}")
-
-                    try:
-                        workflow_id = clue.workflow_id if clue else None
-                        await event_bus.emit(ClueEndEvent(
-                            clue_id=clue_id,
-                            workflow_id=workflow_id,
-                            event_data={
-                                "code": end_code,
-                                "reason": close_reason,
-                            }
-                        ))
-                    except Exception as end_err:
-                        logger.warning(f"[PostCallHandler] 触发 clue_ended 回推异常: {end_err}")
-
-                    return True
-
-                # 未满足直接打通结案条件的场景 (未接通需要追呼重试，或多日多次策略引擎推演)
+                # 6. 统一由 AgentDrivenStrategyEngine 推演下一步排期或终态流转
                 schedule_result = await engine.calculate(context)
 
                 # 消费跨业务动态热切换建议 (Workflow Handoff)

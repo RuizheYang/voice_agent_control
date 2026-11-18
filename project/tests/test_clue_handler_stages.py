@@ -3,7 +3,6 @@ from unittest.mock import MagicMock, AsyncMock
 
 from app.clue_handler.contracts import (
     BaseInflowHandler,
-    BaseNewClueHandler,
     BasePostCallHandler,
     BaseScheduleHandler,
     BaseCancelHandler,
@@ -12,7 +11,6 @@ from app.clue_handler.contracts import (
 )
 from app.clue_handler.stages import (
     DefaultInflowHandler,
-    NewClueHandler,
     INFLOW_REGISTRY,
     get_inflow_handler_cls,
     DefaultPostCallHandler,
@@ -35,10 +33,8 @@ class TestClueHandlerStageArchitecture(unittest.TestCase):
     """测试 ClueHandler 生命周期分阶段目录架构、契约继承与注册表机制"""
 
     def test_contracts_hierarchy_and_aliases(self):
-        """测试抽象契约继承关系与向后兼容别名"""
-        self.assertIs(BaseNewClueHandler, BaseInflowHandler)
+        """测试抽象契约继承关系与阶段处理器映射"""
         self.assertIs(BaseCancelCallHandler, BaseCancelHandler)
-        self.assertIs(NewClueHandler, DefaultInflowHandler)
         self.assertIs(PostCallHandler, DefaultPostCallHandler)
         self.assertIs(ScheduleHandler, DefaultScheduleHandler)
         self.assertIs(CancelCallHandler, DefaultCancelHandler)

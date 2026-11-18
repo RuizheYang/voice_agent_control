@@ -10,7 +10,6 @@ from app.strategy import (
 )
 from app.clue_handler.contracts import (
     BaseInflowHandler,
-    BaseNewClueHandler,
     BasePostCallHandler,
     BaseScheduleHandler,
     BaseCancelHandler,
@@ -19,7 +18,6 @@ from app.clue_handler.contracts import (
 )
 from app.clue_handler.stages import (
     DefaultInflowHandler,
-    NewClueHandler,
     DefaultPostCallHandler,
     PostCallHandler,
     DefaultScheduleHandler,

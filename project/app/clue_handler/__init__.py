@@ -3,7 +3,6 @@ from .factory import ClueHandlerFactory
 from .state import ClueState, VALID_TRANSITIONS
 from .contracts import (
     BaseInflowHandler,
-    BaseNewClueHandler,
     BasePostCallHandler,
     BaseScheduleHandler,
     BaseCancelHandler,
@@ -12,7 +11,6 @@ from .contracts import (
 )
 from .stages import (
     DefaultInflowHandler,
-    NewClueHandler,
     INFLOW_REGISTRY,
     get_inflow_handler_cls,
     DefaultPostCallHandler,
@@ -37,7 +35,6 @@ __all__ = [
     "VALID_TRANSITIONS",
     # 抽象契约 (Contracts)
     "BaseInflowHandler",
-    "BaseNewClueHandler",
     "BasePostCallHandler",
     "BaseScheduleHandler",
     "BaseCancelHandler",
@@ -45,7 +42,6 @@ __all__ = [
     "CancelClueResult",
     # 阶段实现与注册表 (Stages)
     "DefaultInflowHandler",
-    "NewClueHandler",
     "INFLOW_REGISTRY",
     "get_inflow_handler_cls",
     "DefaultPostCallHandler",

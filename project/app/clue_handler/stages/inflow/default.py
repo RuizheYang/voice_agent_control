@@ -49,11 +49,11 @@ class DefaultInflowHandler(BaseInflowHandler):
         try:
             from app.dbmodels.models import OutboundStrategy
             strategy = await OutboundStrategy.filter(strategy_id=strategy_id).first()
-            schedule_id = strategy.schedule_id if strategy and strategy.schedule_id else "seven_day_three_call"
+            schedule_id = strategy.schedule_id if strategy and strategy.schedule_id else "agent_driven"
             return resolver(schedule_id)
         except Exception as e:
             logger.warning(f"[DefaultInflowHandler] 获取线索策略失败，使用兜底引擎: {e}")
-            return resolver("seven_day_three_call")
+            return resolver("agent_driven")
 
     async def schedule_call(
         self, 
@@ -218,7 +218,3 @@ class DefaultInflowHandler(BaseInflowHandler):
             success = await self.schedule_call(clue, intake_time)
 
         return success
-
-
-# 历史兼容别名
-NewClueHandler = DefaultInflowHandler

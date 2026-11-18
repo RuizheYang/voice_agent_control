@@ -186,7 +186,7 @@ class TestAgentAndStrategyCreation(unittest.IsolatedAsyncioTestCase):
         """测试按照文档 2.2 完整规范创建外呼跟进策略"""
         req = StrategyCreateRequest(
             strategy_id="strategy-1234567",
-            schedule_id="seven_day_three_call",
+            schedule_id="agent_driven",
             name="三天通用追呼策略",
             followup=FollowupConfig(
                 summary_type="single_call", summary_prompt="recommend-common-interest",
@@ -212,7 +212,7 @@ class TestAgentAndStrategyCreation(unittest.IsolatedAsyncioTestCase):
 
         strat_data = resp.data
         self.assertEqual(strat_data["strategy_id"], "strategy-1234567")
-        self.assertEqual(strat_data["schedule_id"], "seven_day_three_call")
+        self.assertEqual(strat_data["schedule_id"], "agent_driven")
         self.assertEqual(strat_data["followup"]["summary_type"], "single_call")
         self.assertEqual(strat_data["followup"]["summary_prompt"], "recommend-common-interest")
         self.assertEqual(strat_data["followup"]["max_followup_hours"], 72)
@@ -235,7 +235,7 @@ class TestAgentAndStrategyCreation(unittest.IsolatedAsyncioTestCase):
     async def test_strategy_create_auto_generates_id(self):
         """测试不传 strategy_id 时服务端自动生成唯一 ID"""
         req = StrategyCreateRequest(
-            schedule_id="seven_day_three_call",
+            schedule_id="agent_driven",
             followup=FollowupConfig(
                 summary_type="single_call", summary_prompt="default-summary",
                 max_followup_hours=48,
@@ -256,7 +256,7 @@ class TestAgentAndStrategyCreation(unittest.IsolatedAsyncioTestCase):
         await OutboundStrategy.create(
             strategy_id="strat-update-test",
             name="OldName",
-            schedule_id="seven_day_three_call",
+            schedule_id="agent_driven",
             followup={"summary_type": "single_call", "summary_prompt": "old_sum", "max_calls": 3}
         )
 
@@ -482,7 +482,7 @@ class TestAgentAndStrategyCreation(unittest.IsolatedAsyncioTestCase):
                     knowledge_base={"kb_id": "kb-carloan-qa"},
                     tools=["check_wechat_account", "add_wechat"],
                     llm=LlmConfig(model_id="gemma4-31B"),
-                    instruction="你是易鑫金融客服，客户姓名是 {{user_name}}，核实用户车贷需求与意向。",
+                    instruction="你是汽车金融客服，客户姓名是 {{user_name}}，核实用户车贷需求与意向。",
                 ),
                 agent_type="single_prompt",
                 open_message="您好，请问是 {{user_name}} 先生/女士吗？",
@@ -490,7 +490,7 @@ class TestAgentAndStrategyCreation(unittest.IsolatedAsyncioTestCase):
             ),
             strategy=StrategyCreateRequest(
                 strategy_id="strategy-carloan-3d",
-                schedule_id="seven_day_three_call",
+                schedule_id="agent_driven",
                 name="车贷3天排期跟进策略",
                 followup=FollowupConfig(
                     summary_type="single_call", summary_prompt="recommend-common-interest",
@@ -533,7 +533,7 @@ class TestAgentAndStrategyCreation(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(data["voice_agent"])
         self.assertEqual(data["voice_agent"]["agent_name"], "CarLoanVoiceAgent")
         self.assertIsNotNone(data["strategy"])
-        self.assertEqual(data["strategy"]["schedule_id"], "seven_day_three_call")
+        self.assertEqual(data["strategy"]["schedule_id"], "agent_driven")
 
         # 数据库三张表落库校验
         wf_record = await WorkflowBinding.filter(workflow_id="car_loan_bundle_001").first()
@@ -554,7 +554,7 @@ class TestAgentAndStrategyCreation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(query_resp.code, 0)
         self.assertEqual(query_resp.data["workflow_id"], "car_loan_bundle_001")
         self.assertEqual(query_resp.data["voice_agent"]["agent_name"], "CarLoanVoiceAgent")
-        self.assertEqual(query_resp.data["strategy"]["schedule_id"], "seven_day_three_call")
+        self.assertEqual(query_resp.data["strategy"]["schedule_id"], "agent_driven")
 
     async def test_workflow_bundle_create_auto_generates_sub_ids(self):
         """测试不传 agent_id 和 strategy_id 时，聚合创建自动生成唯一 ID 并正确绑定"""
@@ -565,7 +565,7 @@ class TestAgentAndStrategyCreation(unittest.IsolatedAsyncioTestCase):
                 instruction="自动生成ID的提示词",
             ),
             strategy=StrategyCreateRequest(
-                schedule_id="seven_day_three_call",
+                schedule_id="agent_driven",
                 followup=FollowupConfig(
                     summary_type="single_call", summary_prompt="auto-summary",
                     max_followup_hours=24,
@@ -597,7 +597,7 @@ class TestAgentAndStrategyCreation(unittest.IsolatedAsyncioTestCase):
         await OutboundStrategy.create(
             strategy_id="strategy-reuse-001",
             name="ReusedStrategy",
-            schedule_id="seven_day_three_call",
+            schedule_id="agent_driven",
             followup={"summary_type": "single_call", "summary_prompt": "sum1"},
         )
 
@@ -628,7 +628,7 @@ class TestAgentAndStrategyCreation(unittest.IsolatedAsyncioTestCase):
             agent_id="agent-hybrid-01",
             strategy=StrategyCreateRequest(
                 strategy_id="strat-hybrid-new",
-                schedule_id="seven_day_three_call",
+                schedule_id="agent_driven",
                 followup=FollowupConfig(
                     summary_type="single_call", summary_prompt="hybrid-summary",
                     max_followup_hours=48,
@@ -714,7 +714,7 @@ class TestAgentAndStrategyCreation(unittest.IsolatedAsyncioTestCase):
             ),
             strategy=StrategyCreateRequest(
                 strategy_id="strat-poly-01",
-                schedule_id="seven_day_three_call",
+                schedule_id="agent_driven",
                 followup=FollowupConfig(
                     summary_type="single_call", summary_prompt="poly-sum",
                     max_followup_hours=24,

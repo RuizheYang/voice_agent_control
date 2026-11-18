@@ -545,7 +545,7 @@ async def test_atomic_handoff_refreshes_clue_config_from_target_strategy():
     await OutboundStrategy.create(
         strategy_id="strat_car_loan_target",
         name="车贷标准策略",
-        schedule_id="seven_day_three_call",
+        schedule_id="agent_driven",
         followup={"max_calls": 5, "min_interval_seconds": 3600},
         sip={"line_id": "sip_loan_01"},
     )

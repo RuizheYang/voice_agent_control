@@ -18,7 +18,6 @@ from app.schemas.clue_create import NormalizedClue
 from app.call_schedule.contracts import ScheduledCallRequest
 from app.schemas.call_end import CallEndRequest, CallEndData, CallEndCurrentCall, CallEndOutboundReport
 from app.strategy.contracts import ScheduleResult
-from app.strategy.single_call.engine import SingleCallStrategyEngine
 from app.utils.exceptions import StateTransitionError
 
 
@@ -252,23 +251,15 @@ class TestStateMachineTransitions(unittest.IsolatedAsyncioTestCase):
             workflow_id="wf_001",
             strategy_id="strat_001",
         )
-        await OutboundStrategy.create(strategy_id="strat_001", schedule_id="single_call")
+        await OutboundStrategy.create(strategy_id="strat_001", schedule_id="agent_driven")
 
-        mock_summary_engine = MagicMock()
-        mock_summary_engine.analyze_call = AsyncMock(return_value={
-            "decision": "success",
-            "reason": "真人接通并同意加微",
-            "common_call_events": {
-                "wechat_requested": "yes",
-                "is_voicemail": "no",
-                "call_summary": "客户同意添加微信",
-            },
-            "business_result": {"action": "wechat"},
-        })
-
-        mock_strategy = MagicMock(spec=SingleCallStrategyEngine)
+        mock_strategy = AsyncMock()
+        mock_strategy.calculate.return_value = ScheduleResult(
+            success=False,
+            reason="真人接通并同意后续通道触达",
+            business_status="success",
+        )
         handler = PostCallHandler(
-            summary_engine=mock_summary_engine,
             strategy_engine=mock_strategy,
         )
 
@@ -291,7 +282,7 @@ class TestStateMachineTransitions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current_state, ClueState.PENDING.value)
 
     async def test_postcall_handler_transitions_to_accepted_on_success(self):
-        """测试挂机处理：单通打通达标结案，状态流转为 ACCEPTED"""
+        """测试挂机处理：Agent 判定达标结案，状态流转为 ACCEPTED"""
         clue_id = "clue_pc_sm_006"
         await ClueInfo.create(
             clue_id=clue_id,
@@ -300,23 +291,15 @@ class TestStateMachineTransitions(unittest.IsolatedAsyncioTestCase):
             workflow_id="wf_001",
             strategy_id="strat_001",
         )
-        await OutboundStrategy.create(strategy_id="strat_001", schedule_id="single_call")
+        await OutboundStrategy.create(strategy_id="strat_001", schedule_id="agent_driven")
 
-        mock_summary_engine = MagicMock()
-        mock_summary_engine.analyze_call = AsyncMock(return_value={
-            "decision": "success",
-            "reason": "已有效连通",
-            "common_call_events": {
-                "wechat_requested": "no",
-                "is_voicemail": "no",
-                "call_summary": "沟通良好",
-            },
-            "business_result": {},
-        })
-
-        mock_strategy = MagicMock(spec=SingleCallStrategyEngine)
+        mock_strategy = AsyncMock()
+        mock_strategy.calculate.return_value = ScheduleResult(
+            success=False,
+            reason="已有效连通并达成业务目标",
+            business_status="success",
+        )
         handler = PostCallHandler(
-            summary_engine=mock_summary_engine,
             strategy_engine=mock_strategy,
         )
 
@@ -348,18 +331,7 @@ class TestStateMachineTransitions(unittest.IsolatedAsyncioTestCase):
             workflow_id="wf_001",
             strategy_id="strat_002",
         )
-        await OutboundStrategy.create(strategy_id="strat_002", schedule_id="seven_day_three_call")
-
-        mock_summary_engine = MagicMock()
-        mock_summary_engine.analyze_call = AsyncMock(return_value={
-            "decision": "schedule",
-            "reason": "用户未接通",
-            "common_call_events": {
-                "wechat_requested": "no",
-                "is_voicemail": "no",
-            },
-            "business_result": {},
-        })
+        await OutboundStrategy.create(strategy_id="strat_002", schedule_id="agent_driven")
 
         mock_strategy = AsyncMock()
         mock_strategy.calculate.return_value = ScheduleResult(
@@ -367,10 +339,10 @@ class TestStateMachineTransitions(unittest.IsolatedAsyncioTestCase):
             next_call_time=datetime(2026, 10, 23, 14, 0, tzinfo=timezone.utc),
             priority=5,
             use_work_phone=False,
+            business_status="failure",
         )
 
         handler = PostCallHandler(
-            summary_engine=mock_summary_engine,
             strategy_engine=mock_strategy,
         )
 

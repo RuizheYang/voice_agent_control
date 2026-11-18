@@ -377,7 +377,7 @@
 
             try {
                 // 单接口全包查询：只发 1 个 HTTP 请求
-                const resp = await fetch(`/database/clue_state?clueId=${encodeURIComponent(clueId)}`);
+                const resp = await fetch(`/api/observability/clue-trace?clueId=${encodeURIComponent(clueId)}`);
                 if (!resp.ok) {
                     throw new Error(`HTTP Error ${resp.status}`);
                 }

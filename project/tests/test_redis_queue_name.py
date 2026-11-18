@@ -16,27 +16,15 @@ class TestRedisQueueNameIsolation(unittest.IsolatedAsyncioTestCase):
     """验证 Redis 队列名称全链路隔离，确保全部切换为 voice_agent_hub"""
 
     def test_config_files_redis_queue_name(self):
-        """测试 test.json 与 prod.json 中的 redis_queue_name 均配置为 voice_agent_hub"""
+        """测试 config.example.json 中的 redis_queue_name 配置为 voice_agent_hub"""
         configs_dir = Path(__file__).parent.parent / "app" / "configs"
-        
-        # 1. 验证 test.json
-        test_json_path = configs_dir / "test.json"
-        with open(test_json_path, "r", encoding="utf-8") as f:
-            test_cfg = json.load(f)
+        example_json_path = configs_dir / "config.example.json"
+        with open(example_json_path, "r", encoding="utf-8") as f:
+            example_cfg = json.load(f)
         self.assertEqual(
-            test_cfg.get("redis_queue_name"), 
-            "voice_agent_hub", 
-            "test.json 中的 redis_queue_name 必须为 voice_agent_hub"
-        )
-
-        # 2. 验证 prod.json
-        prod_json_path = configs_dir / "prod.json"
-        with open(prod_json_path, "r", encoding="utf-8") as f:
-            prod_cfg = json.load(f)
-        self.assertEqual(
-            prod_cfg.get("redis_queue_name"), 
-            "voice_agent_hub", 
-            "prod.json 中的 redis_queue_name 必须为 voice_agent_hub"
+            example_cfg.get("redis_queue_name"),
+            "voice_agent_hub",
+            "config.example.json 中的 redis_queue_name 必须为 voice_agent_hub",
         )
 
     def test_current_runtime_config_queue_name(self):
@@ -44,20 +32,11 @@ class TestRedisQueueNameIsolation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.redis_queue_name, "voice_agent_hub")
 
     def test_config_fallback_defaults(self):
-        """测试当配置字典未提供 queue 名称时，Config 缺省 fallback 为 voice_agent_hub"""
-        configs_dir = Path(__file__).parent.parent / "app" / "configs"
-        with open(configs_dir / "test.json", "r", encoding="utf-8") as f:
-            base_cfg = json.load(f)
-        
-        # 移除队列配置字段以测试缺省值
-        base_cfg.pop("redis_queue_name", None)
-        base_cfg.pop("event_queue_name", None)
-
-        with patch.dict("os.environ", {"ENV": "test"}):
-            with patch("json.load", return_value=base_cfg):
-                c = Config.from_config()
-                self.assertEqual(c.redis_queue_name, "voice_agent_hub")
-                self.assertEqual(c.event_queue_name, "voice_agent_hub_events")
+        """测试当无配置文件且未提供队列环境变量时，Config 缺省 fallback 为 voice_agent_hub"""
+        with patch.object(Config, "_load_json_dict", return_value={}):
+            c = Config.from_config()
+            self.assertEqual(c.redis_queue_name, "voice_agent_hub")
+            self.assertEqual(c.event_queue_name, "voice_agent_hub_events")
 
     def test_delayed_queue_default_key(self):
         """测试延迟队列的缺省 key 隔离为 voice_agent_hub:delayed_tasks"""

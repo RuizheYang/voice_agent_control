@@ -18,7 +18,7 @@ from app.redis_client.redis_manager import redis_manager
 from app.routers import clue_webhook
 from app.routers import clue_inflow
 from app.routers import config_admin
-from app.routers import database as database_router
+from app.routers import observability as observability_router
 from app.routers import analytics as analytics_router
 from app.observability.events_bus import event_bus
 from fastapi import FastAPI, Request, applications
@@ -49,9 +49,9 @@ async def lifespan(app: FastAPI):
         _enable_global_fallback=True
     )
 
-    current_env = os.getenv("ENV", "prod").lower()
+    current_env = os.getenv("ENV", "dev").lower()
 
-    if current_env in ["test", "uat"]:
+    if current_env in ["dev", "test", "uat"]:
         logger.info(f"当前环境为 {current_env}，尝试自动同步数据库表结构...")
         await Tortoise.generate_schemas(safe=True)
     else:
@@ -114,7 +114,7 @@ app.add_middleware(
 app.include_router(clue_inflow.router)
 app.include_router(config_admin.router)
 app.include_router(clue_webhook.router)
-app.include_router(database_router.router)
+app.include_router(observability_router.router)
 app.include_router(analytics_router.router)
 
 @app.get("/simulator", response_class=HTMLResponse, tags=["simulator"])
@@ -137,4 +137,4 @@ async def get_analytics_dashboard():
 
 @app.get("/voice-agent-hub/monitor")
 async def monitor():
-    return {"code": 0, "msg": "OK", "records": "加微Agent服务就绪"}
+    return {"code": 0, "msg": "OK", "records": "Voice Agent Control service ready"}

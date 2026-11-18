@@ -62,7 +62,7 @@ class OutboundStrategy(Model):
     id = fields.BigIntField(primary_key=True, description="数据库内部主键")
     strategy_id = fields.CharField(max_length=128, unique=True, db_index=True, source_field="strategyId", description="策略实例唯一ID")
     name = fields.CharField(max_length=128, null=True, default="", description="策略显示名称")
-    schedule_id = fields.CharField(max_length=128, default="seven_day_three_call", source_field="scheduleId", description="内置追呼排期方案ID")
+    schedule_id = fields.CharField(max_length=128, default="agent_driven", source_field="scheduleId", description="排期引擎方案ID (agent_driven)")
     schedule_version = fields.CharField(max_length=32, default="1.0", source_field="scheduleVersion", description="内置排期模板版本")
     followup = fields.JSONField(default=dict, description="跟进配置JSON (summary_type 模块标识、summary_prompt 补充提取及四项追呼限制)")
     decision_rule_version = fields.CharField(max_length=32, default="1", source_field="decisionRuleVersion", description="内部决策规则版本")
@@ -379,28 +379,6 @@ class PauseRecord(Model):
     class Meta:
         table = "pause_record"
 
-class Clue(Model):
-    """外呼服务兼容线索表；新流入时同步新增已有字段。"""
-    id = fields.IntField(primary_key=True)
-    requestId = fields.CharField(max_length=255, null=True, index=True)
-    clueId = fields.CharField(max_length=255, null=True)
-    clueSource = fields.CharField(max_length=255, null=True)
-    orderTime = fields.CharField(max_length=50, null=True)
-    customerName = fields.CharField(max_length=255, null=True)
-    customerSex = fields.CharField(max_length=10, null=True)  # e.g., '先生' or '女士'
-    customerPhoneNum = fields.CharField(max_length=128, null=True)
-    strategyId = fields.CharField(max_length=50, null=True)
-    agentData = fields.TextField(null=True)
-    agentId = fields.CharField(max_length=255, null=True)
-    summaryId = fields.CharField(max_length=255, null=True)
-    callBatchId = fields.CharField(max_length=50, null=True, index=True)
-    status = fields.CharField(max_length=128, null=True)
-    createTime = fields.DatetimeField(auto_now_add=True)
-    updateTime = fields.DatetimeField(auto_now=True)
-
-    class Meta:
-        indexes = (("callBatchId", "clueId"),)
-
 
 # ==============================================================================
 # 8. 应用调用方鉴权表
@@ -428,18 +406,7 @@ class AppAuth(Model):
         return self.app_secret
 
 
-# ==============================================================================
-# 兼容性别名 (保障旧代码或旧依赖平滑过渡)
-# ==============================================================================
-WorkflowConfig = WorkflowBinding
-StrategyConfig = OutboundStrategy
-VoiceAgentConfig = VoiceAgent
-# Clue 是独立的兼容线索表，不能再用 ClueInfo 别名覆盖其模型注册。
-ClueState = ClueInfo
-EndCallRecord = CallRecord
-EndCallIdempotency = ExecutionTask
-
-EndCallRecordPydantic = pydantic_model_creator(
+CallRecordPydantic = pydantic_model_creator(
     CallRecord,
-    name="EndCallRecordPydantic",
+    name="CallRecordPydantic",
 )

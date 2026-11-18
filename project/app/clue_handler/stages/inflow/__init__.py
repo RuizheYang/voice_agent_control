@@ -1,8 +1,7 @@
 from typing import Dict, Type
 from app.clue_handler.contracts.base_inflow import BaseInflowHandler
-from .default import DefaultInflowHandler, NewClueHandler
+from .default import DefaultInflowHandler
 
-# 线索流入阶段处理器注册表
 INFLOW_REGISTRY: Dict[str, Type[BaseInflowHandler]] = {
     "default": DefaultInflowHandler,
 }
@@ -21,7 +20,6 @@ def get_inflow_handler_cls(name: str = "default") -> Type[BaseInflowHandler]:
 
 __all__ = [
     "DefaultInflowHandler",
-    "NewClueHandler",
     "INFLOW_REGISTRY",
     "get_inflow_handler_cls",
 ]

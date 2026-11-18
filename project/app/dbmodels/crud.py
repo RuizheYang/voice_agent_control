@@ -13,7 +13,6 @@ from tortoise.transactions import in_transaction
 from app.redis_client.redis_manager import redis_manager
 from app.schemas.call_end import CallEndRequest, CallEndOutboundReport
 from app.schemas.clue_create import NormalizedClue
-from app.summary.contracts import SummaryResult
 from app.utils.exceptions import LockTimeoutError, StateTransitionError, WorkflowAgentPairingError
 
 import uuid
@@ -22,8 +21,7 @@ from pydantic import BaseModel, Field
 from .models import (
     VoiceAgent, OutboundStrategy, WorkflowBinding, WorkflowDomainConfig,
     ClueInfo, CallRecord, ExecutionTask, PauseRecord, AppAuth,
-    WorkflowConfig, StrategyConfig, VoiceAgentConfig,
-    Clue, ClueState, EndCallRecord, EndCallRecordPydantic
+    CallRecordPydantic,
 )
 class ClueEventRecord(BaseModel):
     clue_id: str
@@ -89,13 +87,9 @@ async def create_clue(clue: NormalizedClue) -> ClueInfo:
         }
 
     followup = strategy.followup if strategy and isinstance(strategy.followup, dict) else {}
-    schedule_id = strategy.schedule_id if strategy else None
-    default_hours = 168 if schedule_id in ("seven_day_three_call", "sevenday", "seven_day") else 72
-    max_followup_hours = followup.get("max_followup_hours", followup.get("maxFollowupHours", default_hours))
+    max_followup_hours = followup.get("max_followup_hours", followup.get("maxFollowupHours", 72))
     if type(max_followup_hours) is not int or max_followup_hours <= 0:
         raise ValueError("max_followup_hours must be a positive integer")
-
-    from app.clue_inflow.repository import sync_to_clue
 
     async with in_transaction() as connection:
         clue_record, created = await ClueInfo.get_or_create(
@@ -129,8 +123,6 @@ async def create_clue(clue: NormalizedClue) -> ClueInfo:
             if clue_config:
                 clue_record.clue_config = clue_config
             await clue_record.save(using_db=connection)
-
-        await sync_to_clue(clue_record, clue.requestId, using_db=connection)
 
     return clue_record
 
@@ -487,7 +479,7 @@ async def get_call_history(clue_id: str) -> List[Any]:
     """查询线索的历史通话记录"""
     # 排期时即会建立created记录，策略历史只应读取已经结束的通话。
     call_history = await CallRecord.filter(clue_id=clue_id, status="ended").order_by('-create_time')
-    return [EndCallRecordPydantic.model_validate(record) for record in call_history]
+    return [CallRecordPydantic.model_validate(record) for record in call_history]
 
 
 async def has_end_call_code(clue_id: str, one_level_code: int, two_level_code: int) -> bool:
@@ -547,20 +539,16 @@ async def get_clue_history_stats(clue_id: str, call_end_time: Optional[datetime]
     }
 
 
-async def save_call_summary_result(call_id: str, summary_result: SummaryResult | dict) -> CallRecord:
-    """保存一通明确通话的 Summary；不修改执行决策、线索状态或排期。
-
-    新调用方使用此入口；旧 save_call_summary_record 保持原行为。
-    在调用方已有事务内调用时，本次写入随外层事务提交或回滚。
-    """
-    result = SummaryResult.model_validate(summary_result)
+async def save_call_summary_result(call_id: str, summary_result: BaseModel | dict) -> CallRecord:
+    """保存一通明确通话的结构化分析结论（不修改线索状态或排期）。"""
+    payload = summary_result.model_dump(mode="json") if isinstance(summary_result, BaseModel) else dict(summary_result)
     async with in_transaction() as connection:
         record = await CallRecord.filter(call_id=call_id).using_db(connection).select_for_update().get()
         details = dict(record.decision_result or {})
-        details["summary"] = result.model_dump(mode="json")
+        details["summary"] = payload
         record.decision_result = details
-        record.common_call_events = result.common_call_events
-        record.summary_status = result.analysis_status
+        record.common_call_events = payload.get("common_call_events") or payload
+        record.summary_status = payload.get("analysis_status", "succeeded")
         await record.save(using_db=connection, update_fields=[
             "decision_result", "common_call_events", "summary_status", "update_time",
         ])

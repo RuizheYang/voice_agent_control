@@ -55,7 +55,6 @@ class AppAuthRegisterRequest(BaseModel):
 # ==================== 1. Voice Agent 配置管理 ====================
 
 @router.post("/voice-agent/create", response_model=VoiceAgentConfigResponse, summary="创建或更新 Voice Agent")
-@router.post("/admin/voice-agent/create", response_model=VoiceAgentConfigResponse, include_in_schema=False)
 async def create_voice_agent(request: VoiceAgentCreateRequest) -> VoiceAgentConfigResponse:
     """创建或更新 Voice Agent 配置 (传入 agent_id 则更新/创建，未传入则自动生成 agent_id)"""
     logger.info(f"创建/更新 Voice Agent: agent_id={request.agent_id}, agent_name={request.agent_name}")
@@ -81,7 +80,6 @@ async def create_voice_agent(request: VoiceAgentCreateRequest) -> VoiceAgentConf
         return VoiceAgentConfigResponse(code=3, msg=f"创建 Voice Agent 失败: {str(e)}", data=None)
 
 @router.get("/voice-agent/{agent_identifier}", response_model=VoiceAgentConfigResponse, summary="查询 Voice Agent 配置")
-@router.get("/admin/voice-agent/{agent_identifier}", response_model=VoiceAgentConfigResponse, include_in_schema=False)
 async def get_voice_agent(
     agent_identifier: str = Path(..., description="Agent 唯一标识 (agent_id) 或显示名称 (agent_name)"),
     version: Optional[str] = Query(None, description="版本标识")
@@ -109,7 +107,6 @@ async def get_voice_agent(
 # ==================== 2. 外呼跟进策略配置管理 ====================
 
 @router.post("/strategy/create", response_model=StrategyConfigResponse, summary="创建或更新外呼跟进策略")
-@router.post("/admin/strategy/create", response_model=StrategyConfigResponse, include_in_schema=False)
 async def create_strategy(request: StrategyCreateRequest) -> StrategyConfigResponse:
     """创建或更新外呼策略配置 (绑定内置 schedule_id 追呼排期方案)"""
     logger.info("创建/更新外呼策略: strategy_id=%r, schedule_id=%r, summary_type=%r, has_summary_prompt=%s",
@@ -135,7 +132,6 @@ async def create_strategy(request: StrategyCreateRequest) -> StrategyConfigRespo
         return StrategyConfigResponse(code=3, msg=f"创建外呼策略失败: {str(e)}", data=None)
 
 @router.get("/strategy/{strategy_id}", response_model=StrategyConfigResponse, summary="查询外呼跟进策略")
-@router.get("/admin/strategy/{strategy_id}", response_model=StrategyConfigResponse, include_in_schema=False)
 async def get_strategy(strategy_id: str = Path(..., description="外呼策略ID")) -> StrategyConfigResponse:
     """查询外呼策略配置"""
     config_record = await get_strategy_config(strategy_id)
@@ -158,7 +154,6 @@ async def get_strategy(strategy_id: str = Path(..., description="外呼策略ID"
 # ==================== 3. 业务线 Workflow 绑定与一站式聚合管理 ====================
 
 @router.post("/workflow/bundle/create", response_model=WorkflowConfigResponse, summary="一站式创建或更新业务线配置包")
-@router.post("/admin/workflow/bundle/create", response_model=WorkflowConfigResponse, include_in_schema=False)
 async def create_workflow_bundle(request: WorkflowBundleCreateRequest) -> WorkflowConfigResponse:
     """
     一站式业务线配置包聚合创建/更新 (Facade 模式)：
@@ -191,7 +186,6 @@ async def create_workflow_bundle(request: WorkflowBundleCreateRequest) -> Workfl
 
 
 @router.post("/workflow/create", response_model=WorkflowConfigResponse, summary="创建或更新业务线 Workflow 绑定")
-@router.post("/admin/workflow/create", response_model=WorkflowConfigResponse, include_in_schema=False)
 async def create_workflow(request: WorkflowCreateRequest) -> WorkflowConfigResponse:
     """
     创建或更新业务流程与默认策略、Agent的绑定配置：
@@ -224,7 +218,6 @@ async def create_workflow(request: WorkflowCreateRequest) -> WorkflowConfigRespo
 
 
 @router.get("/workflow/{workflow_id}", response_model=WorkflowConfigResponse, summary="查询业务线 Workflow 配置")
-@router.get("/admin/workflow/{workflow_id}", response_model=WorkflowConfigResponse, include_in_schema=False)
 async def get_workflow(workflow_id: str = Path(..., description="业务线流程标识")) -> WorkflowConfigResponse:
     """查询业务线 Workflow 配置 (附带关联的 Agent 和策略详情快照)"""
     config_record = await get_workflow_config(workflow_id)
@@ -288,7 +281,6 @@ async def get_workflow(workflow_id: str = Path(..., description="业务线流程
 
 
 @router.post("/workflow/{workflow_id}/dry-run", response_model=WorkflowConfigResponse, summary="业务线卡带模拟预检 (Dry-Run)")
-@router.post("/admin/workflow/{workflow_id}/dry-run", response_model=WorkflowConfigResponse, include_in_schema=False)
 async def dry_run_workflow(
     workflow_id: str = Path(..., description="业务线流程标识"),
     request: WorkflowDryRunRequest = ...,
@@ -311,7 +303,6 @@ async def dry_run_workflow(
 # ==================== 4. 运行控制 (暂停 / 恢复) ====================
 
 @router.post("/control/pause", response_model=ControlStatusResponse, summary="系统运行暂停开关")
-@router.post("/admin/control/pause", response_model=ControlStatusResponse, include_in_schema=False)
 async def control_pause(request: ControlPauseRequest):
     """
     暂停服务调度：
@@ -340,7 +331,6 @@ async def control_pause(request: ControlPauseRequest):
     )
 
 @router.post("/control/resume", response_model=ControlStatusResponse, summary="系统运行恢复开关")
-@router.post("/admin/control/resume", response_model=ControlStatusResponse, include_in_schema=False)
 async def control_resume(request: ControlResumeRequest):
     """
     恢复服务调度：
@@ -369,7 +359,6 @@ async def control_resume(request: ControlResumeRequest):
     )
 
 @router.get("/control/status", response_model=ControlStatusResponse, summary="查询系统当前暂停状态")
-@router.get("/admin/control/status", response_model=ControlStatusResponse, include_in_schema=False)
 async def control_status():
     """查询流入和次呼排期的暂停状态"""
     return ControlStatusResponse(
@@ -384,7 +373,6 @@ async def control_status():
 # ==================== 5. App 鉴权注册 ====================
 
 @router.post("/auth/register", summary="注册应用 AppId 与 Secret (运维管理)")
-@router.post("/admin/auth/register", summary="注册应用 AppId 与 Secret (运维管理)", include_in_schema=False)
 async def register_app_auth(request: AppAuthRegisterRequest):
     """注册或更新 App 签名鉴权信息"""
     logger.info(f"注册/更新 App 授权: {request.app_id}")

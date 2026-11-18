@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, time, timezone
 from enum import Enum
 from time import perf_counter
+from typing import Any
 from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo
 
@@ -412,51 +413,139 @@ def get_status_url():
     return os.getenv('TELEPHONY_STATUS_URL', config.call_request_config.send_phone_status_url).strip()
 
 
-def valid_endpoint(url, suffix):
+def valid_endpoint(url: str, suffix: str = "") -> bool:
     try:
         parsed = urlsplit(url)
-        return (parsed.scheme in ('http', 'https') and bool(parsed.hostname)
-                and unquote(parsed.path).rstrip('/').endswith(suffix))
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return False
+        if suffix:
+            return unquote(parsed.path).rstrip("/").endswith(suffix)
+        return True
     except ValueError:
         return False
 
 
+class BaseTelephonyGateway:
+    """开放话务网关抽象协议：支持本地 Mock 沙箱或标准 HTTP Webhook 外呼平台。"""
+
+    async def submit_call(self, record: Any) -> SubmitResult:
+        raise NotImplementedError
+
+    async def reconcile_call(self, record: Any) -> SubmitResult:
+        raise NotImplementedError
+
+
+class MockTelephonyGateway(BaseTelephonyGateway):
+    """本地沙箱模拟网关：无需真实语音外呼线路即可端到端跑通调度闭环。"""
+
+    async def submit_call(self, record: Any) -> SubmitResult:
+        call_id = getattr(record, "call_id", "mock_call")
+        clue_id = getattr(record, "clue_id", "unknown")
+        provider_id = f"mock_{call_id}"
+        logger.info(
+            "[MockTelephonyGateway] 【模拟送号成功】clue_id=%r, call_id=%r, provider_call_id=%r",
+            clue_id,
+            call_id,
+            provider_id,
+        )
+        return SubmitResult("accepted", "mock_accepted", provider_call_id=provider_id)
+
+    async def reconcile_call(self, record: Any) -> SubmitResult:
+        call_id = getattr(record, "call_id", "mock_call")
+        return SubmitResult("accepted", "mock_confirmed", provider_call_id=f"mock_{call_id}")
+
+
+class GenericWebhookGateway(BaseTelephonyGateway):
+    """通用 HTTP Webhook 外呼网关：适配任意支持 JSON 回调的语音外呼平台。"""
+
+    async def submit_call(self, record: Any) -> SubmitResult:
+        from app.config import call_schedule_settings as settings
+
+        url, status_url = get_sender_url(), get_status_url()
+        if not url:
+            logger.warning(
+                "[Telephony] 【送号未发起】缺少送号地址: clue_id=%r, status=deferred, code=telephony_endpoint_missing",
+                getattr(record, "clue_id", None),
+            )
+            return SubmitResult("deferred", "telephony_endpoint_missing")
+        if not valid_endpoint(url) or (status_url and not valid_endpoint(status_url)):
+            logger.warning(
+                "[Telephony] 【送号未发起】无效的话务网关 URL: clue_id=%r, url=%s, status_url=%s",
+                getattr(record, "clue_id", None),
+                url,
+                status_url,
+            )
+            return SubmitResult("deferred", "invalid_telephony_endpoint")
+        try:
+            params = TelephonyAPI.model_validate(build_payload(record))
+        except Exception as error:
+            logger.error(
+                "[Telephony] 【送号未发起】运行参数无效: clue_id=%r, status=failed, code=invalid_runtime_config, error_type=%s",
+                getattr(record, "clue_id", None),
+                type(error).__name__,
+            )
+            return SubmitResult("failed", "invalid_runtime_config")
+
+        if status_url:
+            return await make_call_api(
+                url,
+                params,
+                record.clue_id,
+                status_url=status_url,
+                timeout_seconds=settings.http_timeout_seconds,
+                before_send=getattr(record, "before_send", None),
+            )
+
+        # 未配置查询端点时直接发送单次 HTTP POST 送号请求
+        before_send = getattr(record, "before_send", None)
+        if before_send is not None and not await before_send():
+            return SubmitResult("deferred", "submission_gate_closed")
+        payload = params.model_dump(exclude_none=True)
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=settings.http_timeout_seconds)) as session:
+            try:
+                async with session.post(url=url, json=payload, allow_redirects=False) as response:
+                    raw_body = await response.text()
+                    try:
+                        body = json.loads(raw_body)
+                    except ValueError:
+                        body = None
+                    return classify_response(response.status, body)
+            except aiohttp.ClientConnectorError:
+                return SubmitResult("retry", "connection_failed")
+            except (asyncio.TimeoutError, aiohttp.ClientError, UnicodeError):
+                return SubmitResult("unknown", "transport_unknown")
+
+    async def reconcile_call(self, record: Any) -> SubmitResult:
+        from app.config import call_schedule_settings as settings
+
+        status_url = get_status_url()
+        if not valid_endpoint(status_url):
+            return SubmitResult("unknown", "status_endpoint_missing")
+        try:
+            params = TelephonyAPI.model_validate(build_payload(record))
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=settings.http_timeout_seconds)) as session:
+                result = await check_call_task_status(session, params, record.clue_id, url=status_url)
+            if result.status == "found":
+                return SubmitResult("accepted", "confirmed_by_query", result.provider_call_id)
+        except Exception:
+            pass
+        return SubmitResult("unknown", "submission_unconfirmed")
+
+
+def resolve_telephony_gateway() -> BaseTelephonyGateway:
+    """根据配置解析生效的话务网关实现（支持 mock 与 webhook）"""
+    from app.config import config
+
+    mode = (os.getenv("TELEPHONY_GATEWAY_MODE") or config.call_request_config.gateway_mode or "mock").strip().lower()
+    if mode == "mock" or (config.bypass_call and not get_sender_url()):
+        return MockTelephonyGateway()
+    return GenericWebhookGateway()
+
+
 async def submit_call(record):
-    from app.config import call_schedule_settings as settings
-    url, status_url = get_sender_url(), get_status_url()
-    if not url or not status_url:
-        logger.warning("[Telephony] 【送号未发起】缺少送号或查询地址: clue_id=%r, "
-                       "status=deferred, code=telephony_endpoint_missing", getattr(record, "clue_id", None))
-        return SubmitResult('deferred', 'telephony_endpoint_missing')
-    if not valid_endpoint(url, '/outbound/sendPhone/v3') or not valid_endpoint(status_url, '/callTask/page'):
-        logger.warning("[Telephony] 【送号未发起】接口地址不符合原生话务协议: clue_id=%r, "
-                       "url=%s, status_url=%s, status=deferred, code=invalid_telephony_endpoint",
-                       getattr(record, "clue_id", None), url, status_url)
-        return SubmitResult('deferred', 'invalid_telephony_endpoint')
-    try:
-        params = TelephonyAPI.model_validate(build_payload(record))
-    except Exception as error:
-        logger.error("[Telephony] 【送号未发起】运行参数无效: clue_id=%r, "
-                     "status=failed, code=invalid_runtime_config, error_type=%s",
-                     getattr(record, "clue_id", None), type(error).__name__)
-        return SubmitResult('failed', 'invalid_runtime_config')
-    return await make_call_api(url, params, record.clue_id, status_url=status_url,
-                               timeout_seconds=settings.http_timeout_seconds,
-                               before_send=getattr(record, 'before_send', None))
+    return await resolve_telephony_gateway().submit_call(record)
 
 
 async def reconcile_call(record):
-    """对unknown只查询，查不到不代表先前请求没有成功，绝不在这里送号。"""
-    from app.config import call_schedule_settings as settings
-    status_url = get_status_url()
-    if not valid_endpoint(status_url, '/callTask/page'):
-        return SubmitResult('unknown', 'status_endpoint_missing')
-    try:
-        params = TelephonyAPI.model_validate(build_payload(record))
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=settings.http_timeout_seconds)) as session:
-            result = await check_call_task_status(session, params, record.clue_id, url=status_url)
-        if result.status == 'found':
-            return SubmitResult('accepted', 'confirmed_by_query', result.provider_call_id)
-    except Exception:
-        pass
-    return SubmitResult('unknown', 'submission_unconfirmed')
+    """对 unknown 仅查询核对，不重复送号。"""
+    return await resolve_telephony_gateway().reconcile_call(record)

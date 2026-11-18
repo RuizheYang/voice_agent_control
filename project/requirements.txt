@@ -8,6 +8,3 @@ PyYAML==6.0.3
 aiomysql==0.3.2
 cryptography
 pydantic_ai
-numpy==1.26.4
-onnxruntime
-pydub

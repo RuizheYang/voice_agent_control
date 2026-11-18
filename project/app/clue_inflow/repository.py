@@ -10,8 +10,7 @@ from tortoise.expressions import Q
 from tortoise.transactions import in_transaction
 
 from app.clue_inflow import InflowError
-from app.dbmodels.models import Clue, ClueInfo, ExecutionTask, OutboundStrategy, WorkflowBinding
-from app.utils.decrypt import crypted_manager
+from app.dbmodels.models import ClueInfo, ExecutionTask, OutboundStrategy, WorkflowBinding
 
 LEASE_SECONDS = 180
 logger = logging.getLogger(__name__)
@@ -92,67 +91,13 @@ async def duplicate_request_error(key):
                        {"import_task_id": str(existing.id)})
 
 
-async def sync_to_clue(clue_info: ClueInfo, request_id: str, *, using_db=None):
-    """新增 Clue，返回 (记录, 是否新建)；可加入流入事务或独立调用。
-
-    clue_info 必须已入库。锁住来源行，避免本应用并发同步同一线索时重复创建；
-    已存在的 Clue 不覆盖。返回新记录不代表外层事务已经提交。
-    """
-    if using_db is None:
-        async with in_transaction() as connection:
-            return await sync_to_clue(clue_info, request_id, using_db=connection)
-
-    source = await ClueInfo.filter(id=clue_info.id).using_db(using_db).select_for_update().get()
-    existing = await Clue.filter(clueId=source.clue_id).using_db(using_db).order_by("-id").first()
-    if existing:
-        logger.debug("[Clue-Inflow] 【同步跳过】Clue已存在，保留原记录: clue_id=%r, request_id=%r, target_id=%s",
-                     source.clue_id, request_id, existing.id)
-        return existing, False
-
-    # 兼容现有外呼 Agent：表级来源负责回调路由，agentData 中保留业务来源。
-    agent_data = dict(source.agent_data or {})
-    for key, value in (("customerName", source.customer_name), ("customerPhoneNum", source.phone_number)):
-        if not agent_data.get(key) and value:
-            agent_data[key] = crypted_manager.decrypt_field(value) if len(value) > 20 else value
-
-    # 手机号/姓名列复用已有密文，避免再次加密。
-    values = {
-        "requestId": request_id,
-        "clueId": source.clue_id,
-        "clueSource": "commercial",
-        "customerName": source.customer_name,
-        "customerPhoneNum": source.phone_number,
-        "strategyId": source.strategy_id,
-        "agentId": source.agent_id,
-        "summaryId": source.agent_id,
-        "agentData": json.dumps(agent_data, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
-    }
-    # 旧表的部分可选字段更短：不截断标识或密文，也不扩充旧表。
-    for name, value in list(values.items()):
-        limit = getattr(Clue._meta.fields_map[name], "max_length", None)
-        if value is not None and limit is not None and len(value) > limit:
-            values.pop(name)
-            logger.warning("[Clue-Inflow] 【字段跳过】字段超过Clue长度限制，完整值保留在clue_info: clue_id=%r, field=%s, value_length=%s, max_length=%s",
-                           source.clue_id, name, len(value), limit)
-
-    try:
-        target = await Clue.create(using_db=using_db, **values)
-    except Exception as error:
-        logger.error("[Clue-Inflow] 【同步失败】Clue记录写入失败: clue_id=%r, request_id=%r, error_type=%s",
-                     source.clue_id, request_id, type(error).__name__)
-        raise
-    logger.info("[Clue-Inflow] 【同步写入】Clue记录已写入，等待事务提交: clue_id=%r, request_id=%r, target_id=%s",
-                source.clue_id, request_id, target.id)
-    return target, True
-
 async def insert_clue(connection, values, request_id=None):
     clue, created = await ClueInfo.get_or_create(
         using_db=connection, clue_id=values["clue_id"],
         defaults={key: value for key, value in values.items() if key != "clue_id"},
     )
     if created:
-        await sync_to_clue(clue, request_id, using_db=connection)
-        # 与两张线索表一起提交，保证进程在提交后退出时仍能恢复入池。
+        # 事务内同步生成 new_clue 任务，保证进程重启后仍可自动恢复入池。
         key = hashlib.sha256(json.dumps(["new_clue", clue.workflow_instance_id]).encode()).hexdigest()
         await ExecutionTask.create(
             using_db=connection, task_key=key, task_type="new_clue", clue_id=clue.clue_id,

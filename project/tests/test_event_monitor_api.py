@@ -109,9 +109,9 @@ class TestEventMonitorApi(unittest.IsolatedAsyncioTestCase):
             run_at=datetime.now(),
         )
 
-        # 4. 执行单次查询 GET /database/clue_state?clueId=...
+        # 4. 执行单次查询 GET /api/observability/clue-trace?clueId=...
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.get(f"/database/clue_state?clueId={clue_id}")
+            response = await client.get(f"/api/observability/clue-trace?clueId={clue_id}")
             self.assertEqual(response.status_code, 200)
             data = response.json()
 
@@ -150,7 +150,7 @@ class TestEventMonitorApi(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(events[1]["event_type"], "voice_agent_call_request")
 
     async def test_clue_trace_alias_endpoint(self):
-        """测试别名路由 GET /database/clue-trace?clueId=... 同样支持单接口聚合查询"""
+        """测试路由 GET /api/observability/clue-trace?clueId=... 支持单接口聚合查询"""
         clue_id = "clue_trace_alias_002"
         await ClueInfo.create(
             clue_id=clue_id,
@@ -160,7 +160,7 @@ class TestEventMonitorApi(unittest.IsolatedAsyncioTestCase):
         )
 
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.get(f"/database/clue-trace?clueId={clue_id}")
+            response = await client.get(f"/api/observability/clue-trace?clueId={clue_id}")
             self.assertEqual(response.status_code, 200)
             data = response.json()
             self.assertEqual(data["clueId"], clue_id)
@@ -168,7 +168,7 @@ class TestEventMonitorApi(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(data["detail"]["status"], "calling")
 
     async def test_clue_events_get_and_post_support(self):
-        """测试 /database/clue-events 支持 POST 与 GET 双通道查询"""
+        """测试 /api/observability/clue-events 支持 POST 与 GET 双通道查询"""
         clue_id = "clue_events_test_003"
         await ExecutionTask.create(
             task_key="ev_task_003",
@@ -182,17 +182,17 @@ class TestEventMonitorApi(unittest.IsolatedAsyncioTestCase):
 
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             # POST 查询
-            post_resp = await client.post("/database/clue-events", json={"clueId": clue_id})
+            post_resp = await client.post("/api/observability/clue-events", json={"clueId": clue_id})
             self.assertEqual(post_resp.status_code, 200)
             post_data = post_resp.json()
-            self.assertEqual(post_data["code"], 1)
+            self.assertEqual(post_data["code"], 0)
             self.assertEqual(len(post_data["data"]), 1)
             self.assertEqual(post_data["data"][0]["event_type"], "clue_ended")
 
             # GET 查询
-            get_resp = await client.get(f"/database/clue-events?clueId={clue_id}")
+            get_resp = await client.get(f"/api/observability/clue-events?clueId={clue_id}")
             self.assertEqual(get_resp.status_code, 200)
             get_data = get_resp.json()
-            self.assertEqual(get_data["code"], 1)
+            self.assertEqual(get_data["code"], 0)
             self.assertEqual(len(get_data["data"]), 1)
             self.assertEqual(get_data["data"][0]["event_type"], "clue_ended")

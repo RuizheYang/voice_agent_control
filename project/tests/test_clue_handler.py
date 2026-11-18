@@ -6,7 +6,7 @@ from app.clue_handler.clue import ClueHandler
 from app.clue_handler.contracts import (
     BaseCancelCallHandler,
     CancelClueResult,
-    BaseNewClueHandler,
+    BaseInflowHandler,
     BaseScheduleHandler,
     BasePostCallHandler,
 )
@@ -27,7 +27,7 @@ class TestClueHandler(unittest.IsolatedAsyncioTestCase):
         self.mock_cancel = AsyncMock(spec=BaseCancelCallHandler)
         self.mock_cancel.handle.return_value = CancelClueResult(success=True)
         self.mock_handlers = {
-            "new_clue_handler": AsyncMock(spec=BaseNewClueHandler),
+            "new_clue_handler": AsyncMock(spec=BaseInflowHandler),
             "schedule_handler": AsyncMock(spec=BaseScheduleHandler),
             "cancel_call_handler": self.mock_cancel,
             "postcall_handler": AsyncMock(spec=PostCallHandler),

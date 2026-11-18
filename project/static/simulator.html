@@ -148,15 +148,7 @@
         });
 
         async function forceState(targetState) {
-            writeLog(`<span style="color:red">==> FORCE UPDATE STATE: ${targetState}</span>`);
-            try {
-                const res = await fetch(`/database/update_state?clueId=${currentClueId}&state=${targetState}`, { method: 'POST' });
-                const data = await res.json();
-                writeLog(`&nbsp;&nbsp;&nbsp;<-- Recv: Code ${data.code} | Msg: ${data.message}`);
-                setTimeout(fetchState, 300);
-            } catch (e) {
-                writeLog(`&nbsp;&nbsp;&nbsp;<-- <span class="log-err">Req Error: ${e.message}</span>`);
-            }
+            writeLog(`<span style="color:#d97706">已移除无锁强改接口，请通过标准生命周期回调推动状态变化 (${targetState})</span>`);
         }
 
         function generateNewClue() {
@@ -169,7 +161,7 @@
 
         async function fetchState() {
             try {
-                const res = await fetch(`/database/clue_state?clueId=${currentClueId}`);
+                const res = await fetch(`/api/observability/clue-trace?clueId=${currentClueId}`);
                 const data = await res.json();
                 const box = document.getElementById('statusBox');
                 box.innerText = data.state;
@@ -187,14 +179,14 @@
             const container = document.getElementById('eventsContainer');
             container.innerHTML = '<div style="text-align: center; color: #7f8c8d; padding: 20px;">⏳ 正在拉取溯源数据...</div>';
             try {
-                const res = await fetch('/database/clue-events', {
+                const res = await fetch('/api/observability/clue-events', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ clueId: currentClueId })
                 });
                 const responseData = await res.json();
                 
-                if (responseData.code === 1 && responseData.data && responseData.data.length > 0) {
+                if ((responseData.code === 0 || responseData.code === 1) && responseData.data && responseData.data.length > 0) {
                     let html = '';
                     responseData.data.forEach((ev, index) => {
                         let dataStr = ev.eventData ? JSON.stringify(ev.eventData, null, 2) : '无附加数据';

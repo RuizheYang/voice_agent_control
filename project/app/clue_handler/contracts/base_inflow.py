@@ -10,7 +10,3 @@ class BaseInflowHandler(ABC):
     async def handle(self, clue: NormalizedClue) -> bool:
         """处理新线索流入 (校验、首呼决策与状态初始化)"""
         pass
-
-
-# 历史别名兼容
-BaseNewClueHandler = BaseInflowHandler

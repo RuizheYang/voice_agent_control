@@ -332,14 +332,14 @@ class TestVoiceAgentRefactoredPlatform(unittest.IsolatedAsyncioTestCase):
     def test_strategy_schema_creation_with_schedule_id(self):
         strategy = StrategyCreateRequest(
             strategy_id="strategy-test-01",
-            schedule_id="seven_day_three_call",
+            schedule_id="agent_driven",
             followup=FollowupConfig(
                 summary_type="single_call", summary_prompt="recommend-common-interest",
                 max_followup_hours=72,
             )
         )
         self.assertEqual(strategy.strategy_id, "strategy-test-01")
-        self.assertEqual(strategy.schedule_id, "seven_day_three_call")
+        self.assertEqual(strategy.schedule_id, "agent_driven")
 
     async def test_system_control_pause_and_resume(self):
         from app.routers.config_admin import control_pause, control_resume

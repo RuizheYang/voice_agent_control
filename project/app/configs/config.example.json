@@ -1,0 +1,42 @@
+{
+  "database_url": "sqlite://dbfiles/voice_agent_hub.db",
+  "redis": {
+    "cluster_mode": false,
+    "redis_url": "redis://localhost:6379/0",
+    "cluster_nodes": [],
+    "password": "",
+    "decode_responses": true,
+    "socket_connect_timeout": 5,
+    "socket_timeout": 10,
+    "retry_on_timeout": true,
+    "max_connections": 100
+  },
+  "redis_queue_name": "voice_agent_hub",
+  "event_queue_name": "clue-events-v",
+  "security_config": {
+    "version_label": "V1",
+    "encryption_key": "change-me-16-byte-key",
+    "search_salt": "change-me-search-salt"
+  },
+  "telephony": {
+    "gateway_mode": "mock",
+    "call_request_url": "",
+    "send_phone_status_url": "",
+    "cancel_url": "",
+    "bypass_call": true
+  },
+  "llm_factory": {
+    "gpt-4o-mini": {
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "",
+      "headers": {},
+      "extra_body": {},
+      "model_type": "openai"
+    }
+  },
+  "channel_notice": {
+    "url": "",
+    "token": "",
+    "app_id": ""
+  }
+}

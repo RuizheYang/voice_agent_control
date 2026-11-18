@@ -48,8 +48,8 @@ EVENT_ALIAS_MAP = {
 }
 
 class FollowupConfig(BaseModel):
-    summary_type: Optional[str] = Field(None, description="总结版本/套件类型标识，与策略 schedule_id 配套 (如 single_call_summary)")
-    summary_prompt: Optional[str] = Field(None, description="定制化的场景业务 prompt；为空只做固定通用总结，非空额外输出定制业务总结")
+    summary_type: Optional[str] = Field(None, description="业务总结视图标识（可选）")
+    summary_prompt: Optional[str] = Field(None, description="定制化的场景业务 prompt，注入 AgentDrivenStrategyEngine")
     max_followup_hours: int = Field(default=72, gt=0, description="最长追呼时间(小时)")
     max_calls: int = Field(default=10, gt=0, description="单个任务呼叫总次数上限，包含首次呼叫")
     max_call_per_day: int = Field(default=3, gt=0, description="单个任务每天的呼叫次数上限")
@@ -95,9 +95,9 @@ class WebhookSubscription(BaseModel):
 
 class StrategyCreateRequest(BaseModel):
     strategy_id: Optional[str] = Field(None, description="外呼策略总体的唯一ID，若传入则覆盖/更新，不传则自动生成")
-    schedule_id: Optional[str] = Field("seven_day_three_call", description="内置追呼排期方案 ID，决定下一次呼叫的时间 (single_call, seven_day_three_call, agent_driven)")
+    schedule_id: Optional[str] = Field("agent_driven", description="排期引擎方案 ID（agent_driven）")
     name: Optional[str] = Field(None, description="策略名称")
-    followup: FollowupConfig = Field(..., description="通话总结方案和追呼限制配置")
+    followup: FollowupConfig = Field(..., description="Agent 追呼引导与限制配置")
     sip: Optional[SipConfig] = Field(None, description="话务接入和线路配置")
     webhook: Optional[WebhookSubscription] = Field(None, description="外呼事件回推接口")
     model_config = ConfigDict(extra="allow")
@@ -105,7 +105,7 @@ class StrategyCreateRequest(BaseModel):
     @field_validator("schedule_id")
     def validate_schedule_id(cls, v: Optional[str]) -> str:
         if v is None:
-            return "seven_day_three_call"
+            return "agent_driven"
         clean = v.strip().lower()
         from app.strategy.factory import StrategyEngineFactory, SUPPORTED_SCHEDULE_IDS
         if not StrategyEngineFactory.is_valid_schedule_id(clean):

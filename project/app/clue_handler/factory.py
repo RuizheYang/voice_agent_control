@@ -55,42 +55,26 @@ class ClueHandlerFactory:
             except Exception as e:
                 logger.warning(f"[ClueHandlerFactory] 获取 OutboundStrategy '{strategy_id}' 失败: {e}")
 
-            raw_schedule_id = strategy.schedule_id if strategy and strategy.schedule_id else "seven_day_three_call"
+            raw_schedule_id = strategy.schedule_id if strategy and strategy.schedule_id else "agent_driven"
             schedule_id = StrategyEngineFactory.normalize_schedule_id(raw_schedule_id)
             followup = strategy.followup if strategy and isinstance(strategy.followup, dict) else {}
-            # 1) summary_type: 负责总结套件/版本，与策略 schedule_id 配套
-            if schedule_id == "single_call":
-                summary_type = followup.get("summary_type") or followup.get("summaryType") or "single_call"
-            else:
-                summary_type = followup.get("summary_type") or followup.get("summaryType") or "single_call"
-
-            # 2) summary_prompt: 负责定制化的场景业务 prompt (非必填，为空则仅做通用总结)
             raw_prompt = followup.get("summary_prompt") or followup.get("summaryPrompt")
             summary_prompt = raw_prompt.strip() if isinstance(raw_prompt, str) and raw_prompt.strip() else None
 
-            # 2. 拿到确定好的具体策略类和具体总结类 (支持业务卡带注入)
-            if schedule_id == "agent_driven":
-                from app.agents.domain_registry import domain_pack_registry
-                from app.strategy.agent_driven.engine import AgentDrivenStrategyEngine
-                from app.strategy.agent_driven.models import AgentStrategyConfig
+            # 2. 构建并注入 AgentDrivenStrategyEngine（支持领域卡带热覆盖）
+            from app.agents.domain_registry import domain_pack_registry
+            from app.strategy.agent_driven.engine import AgentDrivenStrategyEngine
+            from app.strategy.agent_driven.models import AgentStrategyConfig
 
-                domain_pack = await domain_pack_registry.get_pack(target_wf)
-                agent_cfg = AgentStrategyConfig(
-                    strategy_prompt=summary_prompt,
-                    domain_master_prompt=domain_pack.domain_master_prompt,
-                    allowed_handoff_targets=list(domain_pack.allowed_handoff_targets),
-                    custom_evaluators=list(domain_pack.custom_evaluators),
-                    enabled_sub_prompts=list(domain_pack.enabled_sub_evaluators),
-                )
-                concrete_strategy = AgentDrivenStrategyEngine(config=agent_cfg)
-            else:
-                concrete_strategy = StrategyEngineFactory.get_engine(schedule_id)
-            summary_engine = None
-            try:
-                from app.summary.factory import get_summary_engine
-                summary_engine = get_summary_engine()
-            except Exception as sum_err:
-                logger.debug(f"[ClueHandlerFactory] 总结引擎初始化跳过/降级: {sum_err}")
+            domain_pack = await domain_pack_registry.get_pack(target_wf)
+            agent_cfg = AgentStrategyConfig(
+                strategy_prompt=summary_prompt,
+                domain_master_prompt=domain_pack.domain_master_prompt,
+                allowed_handoff_targets=list(domain_pack.allowed_handoff_targets),
+                custom_evaluators=list(domain_pack.custom_evaluators),
+                enabled_sub_prompts=list(domain_pack.enabled_sub_evaluators),
+            )
+            concrete_strategy = AgentDrivenStrategyEngine(config=agent_cfg)
 
             # 3. 组装专属 Handler：基于生命周期阶段注册表解析对应阶段类 (默认选用 default)
             from app.clue_handler.clue import ClueHandler
@@ -106,8 +90,6 @@ class ClueHandlerFactory:
             )
             postcall_handler = postcall_cls(
                 strategy_engine=concrete_strategy,
-                summary_engine=summary_engine,
-                summary_type=summary_type,
                 summary_prompt=summary_prompt,
             )
             schedule_handler = schedule_cls(
@@ -127,7 +109,7 @@ class ClueHandlerFactory:
             cls._handler_cache[target_wf] = handler
             logger.info(
                 f"[ClueHandlerFactory] 为 workflow '{target_wf}' 装配 ClueHandler 成功 "
-                f"(schedule_id={schedule_id}, summary_type={summary_type})"
+                f"(schedule_id={schedule_id})"
             )
             return handler
 

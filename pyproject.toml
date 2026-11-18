@@ -1,12 +1,26 @@
 [project]
-name = "voice-agent-hub"
-version = "0.1.0"
-description = "Add your description here"
+name = "voice-agent-control"
+version = "0.2.0"
+description = "Always-On Multi-Agent Outbound Voice Scheduling & Cartridge Control Plane built with FastAPI and PydanticAI"
 readme = "README.md"
-requires-python = ">=3.13"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12"
 dependencies = [
-    "beanie>=2.2.0",
-    "fastapi>=0.143.0",
-    "motor>=3.7.1",
-    "tortoise>=0.1.1",
+    "fastapi>=0.115.12",
+    "uvicorn>=0.38.0",
+    "tortoise-orm>=1.1.7",
+    "aiomysql>=0.3.2",
+    "redis>=7.1.0",
+    "aiohttp>=3.13.4",
+    "requests>=2.33.1",
+    "pyyaml>=6.0.3",
+    "cryptography>=44.0.0",
+    "pydantic-ai>=1.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.28.0",
 ]
