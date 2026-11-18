@@ -1,0 +1,12 @@
+[project]
+name = "voice-agent-hub"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "beanie>=2.2.0",
+    "fastapi>=0.143.0",
+    "motor>=3.7.1",
+    "tortoise>=0.1.1",
+]

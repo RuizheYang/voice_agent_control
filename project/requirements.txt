@@ -1,0 +1,13 @@
+tortoise-orm==1.1.7
+fastapi==0.115.12
+uvicorn==0.38.0
+redis==7.1.0
+aiohttp==3.13.4
+requests==2.33.1
+PyYAML==6.0.3
+aiomysql==0.3.2
+cryptography
+pydantic_ai
+numpy==1.26.4
+onnxruntime
+pydub

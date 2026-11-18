@@ -1,0 +1,37 @@
+workflow_id: new_car_sales
+name: 新车试驾邀约线
+version: "v1.0"
+domain_description: "负责新车车型咨询、试驾预约、全款购车跟进与到店邀约"
+
+voice_agent_id: default
+strategy_id: default
+
+enabled_sub_evaluators:
+  - intent
+  - objection
+  - appointment
+  - sentiment
+
+custom_evaluators:
+  - name: test_drive_readiness
+    prompt: "分析客户是否具备近期到店试驾意愿、偏好试驾门店区域及陪同决策人情况"
+    output_fields:
+      willing_to_test_drive: "bool"
+      preferred_store_area: "str"
+      decision_maker_involved: "str"
+
+domain_master_prompt: |
+  本业务线核心目标是促成客户预约线下试驾或同意添加专属销售微信发送车型报价。
+  若客户在通话中明确表示“资金紧张想了解低息分期/车贷方案”，请建议 handoff 至 car_loan 业务线。
+
+allowed_tools:
+  - tool_schedule_followup
+  - tool_set_wakeup_timer
+  - tool_terminate_clue
+  - tool_trigger_channel_action
+  - tool_handoff_workflow
+
+allowed_handoff_targets:
+  - car_loan
+max_handoffs: 2
+max_touches_per_24h: 5

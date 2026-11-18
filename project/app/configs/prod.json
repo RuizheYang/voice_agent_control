@@ -1,0 +1,70 @@
+{
+    "voice_agent_report_url": "http://agentic.yxqiche.com/api/titan/session/call-end",
+    "access_system_url":"http://pipe.yxit.cc/pipe/access/api/v1",
+    "redis": {
+        "redis_url":"",
+        "cluster_nodes": [
+            "10.0.4.221:16379",
+            "10.0.4.222:16379",
+            "10.0.4.223:16379",
+            "10.0.4.224:16379",
+            "10.0.4.225:16379",
+            "10.0.4.226:16379"
+            ],
+        "cluster_mode": true,
+        "password": "q74VBue6Q7ye",
+        "decode_responses": true,
+        "socket_connect_timeout": 5,
+        "socket_timeout": 10,
+        "retry_on_timeout": true,
+        "max_connections": 300
+    },
+    "mysql_url": "mysql://wechat_agent_writer:Tv8)5vEGE25cmU@sfmx91-agent99.dbmy.yxit.cc:5506/wechat_agent?minsize=5&maxsize=30&charset=utf8mb4&pool_recycle=360&connect_timeout=5",
+    "redis_queue_name":"voice_agent_hub",
+    "event_queue_name":"clue-events-v",
+    "security_config": {
+        "it_key_info": {
+            "version_label": "V1",
+            "xor_key": "6b5eSBX6bIGjWRA0",
+            "encrypted_str": "fwJ2m64g8nx4q3F3DwAqIKSKVuYc83QFfOuURzctiFyu7FtKDfORbi6/PdQ="
+        },
+        "business_config": {
+            "search_salt": "Global_Salt_2026"
+        }
+    },
+    "message_reminder_url": "https://carra.yxqiche.com/periphery/api/msg/sendMessage",
+    "asr": {
+        "base_url": "https://nebula-audio.yxqiche.com",
+        "path": "/nebula_dmp/audio/query",
+        "inter_id": "NS0011",
+        "user_id": "scutum",
+        "token_key": "KlKRvWtJiwzgIzzMgAEHyRitdImY8Ovw",
+        "tenant_id": "YIXIN",
+        "language_type": "8k_zh",
+        "voice_format": "wav",
+        "timeout_seconds": 10,
+        "retry_times": 1
+    },
+    "llm_factory": {
+        "gemma-4-31B-it": {
+            "base_url": "https://vesta2.yxqiche.com/vesta/v2/engine_online/flow_schedule/schedule_run_openai/v1",
+            "api_key": "YIXIN-461ba1d80a8669c935edaa4d60545da2",
+            "headers": {
+                "RequestId": "test_1234567890",
+                "TransId": "TEST_GEMMA"
+            },
+            "extra_body": {
+                "chat_template_kwargs": {
+                    "enable_thinking": true,
+                    "separate_reasoning": false
+                }
+            },
+            "model_type": "sglang_openai"
+        }
+    },
+    "wechat_added_notice": {
+        "url": "https://vesta2.yxqiche.com/vesta/v2/engine_online/flow_schedule/schedule_run_openai/callbackpre/v2/wechat_added_success",
+        "token": "YIXIN-6993bbe05c5ce2f14997a67ece0a4d93",
+        "app_id": "2033474192107638784"
+    }
+}

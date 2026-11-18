@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI加微 - 异常拦截与损耗分析盘</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+</head>
+<body class="bg-gray-50 p-8 font-sans text-gray-800">
+
+    <div class="max-w-7xl mx-auto">
+        <div class="flex flex-col md:flex-row justify-between items-center mb-8 space-y-4 md:space-y-0">
+            <h1 class="text-3xl font-bold text-gray-800 border-l-4 border-blue-500 pl-4">加微损耗与异常归因大盘</h1>
+            
+            <div class="flex items-center space-x-3 bg-white p-2 rounded-lg shadow-sm border border-gray-200">
+                <span class="text-gray-500 font-medium px-2">时间范围:</span>
+                <input type="date" id="start_date" class="border border-gray-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400 text-sm">
+                <span class="text-gray-400">-</span>
+                <input type="date" id="end_date" class="border border-gray-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400 text-sm">
+                <button onclick="fetchData()" class="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-1.5 px-5 rounded shadow transition duration-300 ml-2">
+                    🔍 查询
+                </button>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
+            <div class="bg-white rounded-xl shadow-sm p-6 border border-gray-100 flex flex-col justify-between">
+                <div class="flex items-center space-x-2 mb-2"><span class="text-2xl">🛑</span><h3 class="text-gray-500 font-medium">Cancel 抽单总数</h3></div>
+                <div class="text-3xl font-bold text-gray-900 mt-2" id="cancel_count">--</div>
+            </div>
+            <div class="bg-white rounded-xl shadow-sm p-6 border border-purple-200 bg-purple-50 flex flex-col justify-between">
+                <div class="flex items-center space-x-2 mb-2"><span class="text-2xl">💸</span><h3 class="text-purple-700 font-medium">业务抽单致加微流失</h3></div>
+                <div class="text-3xl font-bold text-purple-600 mt-2" id="cancel_loss_count">--</div>
+            </div>
+            <div class="bg-white rounded-xl shadow-sm p-6 border border-gray-100 flex flex-col justify-between">
+                <div class="flex items-center space-x-2 mb-2"><span class="text-2xl">⏳</span><h3 class="text-gray-500 font-medium">Pending 超时总数</h3></div>
+                <div class="text-3xl font-bold text-yellow-600 mt-2" id="pending_timeout_count">--</div>
+            </div>
+            <div class="bg-white rounded-xl shadow-sm p-6 border border-green-200 bg-green-50 flex flex-col justify-between">
+                <div class="flex items-center space-x-2 mb-2"><span class="text-2xl">🏃</span><h3 class="text-green-700 font-medium">pending超时过短致加微流失</h3></div>
+                <div class="text-3xl font-bold text-green-600 mt-2" id="pending_success_count">--</div>
+            </div>
+            <div class="bg-white rounded-xl shadow-sm p-6 border border-gray-100 flex flex-col justify-between">
+                <div class="flex items-center space-x-2 mb-2"><span class="text-2xl">📅</span><h3 class="text-gray-500 font-medium">次呼排期失败</h3></div>
+                <div class="text-3xl font-bold text-red-500 mt-2" id="schedule_fail_count">--</div>
+            </div>
+            <div class="bg-white rounded-xl shadow-sm p-6 border border-gray-100 flex flex-col justify-between">
+                <div class="flex items-center space-x-2 mb-2"><span class="text-2xl">⚠️</span><h3 class="text-gray-500 font-medium">加微接口报错</h3></div>
+                <div class="text-3xl font-bold text-red-700 mt-2" id="wechat_error_count">--</div>
+            </div>
+        </div>
+        
+        <div class="mb-4">
+            <h2 class="text-xl font-bold text-gray-800">各归因指标每日独立趋势分析</h2>
+            <p class="text-sm text-gray-400 mt-1" id="chart_subtitle">当前展示范围：...</p>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            <div class="bg-white rounded-xl shadow-sm p-4 border border-gray-100">
+                <h3 class="font-bold text-gray-700 mb-2">🛑 Cancel 抽单趋势</h3>
+                <div id="chart_cancel" style="width: 100%; height: 260px;"></div>
+            </div>
+            <div class="bg-white rounded-xl shadow-sm p-4 border border-purple-200">
+                <h3 class="font-bold text-purple-700 mb-2">💸 抽单致加微流失 (正向挽回)</h3>
+                <div id="chart_cancel_loss" style="width: 100%; height: 260px;"></div>
+            </div>
+            <div class="bg-white rounded-xl shadow-sm p-4 border border-gray-100">
+                <h3 class="font-bold text-gray-700 mb-2">⏳ Pending 超时趋势</h3>
+                <div id="chart_pending" style="width: 100%; height: 260px;"></div>
+            </div>
+            <div class="bg-white rounded-xl shadow-sm p-4 border border-green-200">
+                <h3 class="font-bold text-green-700 mb-2">🏃 倒计时过短流失 (正向挽回)</h3>
+                <div id="chart_success" style="width: 100%; height: 260px;"></div>
+            </div>
+            <div class="bg-white rounded-xl shadow-sm p-4 border border-gray-100">
+                <h3 class="font-bold text-gray-700 mb-2">📅 次呼排期失败趋势</h3>
+                <div id="chart_schedule" style="width: 100%; height: 260px;"></div>
+            </div>
+            <div class="bg-white rounded-xl shadow-sm p-4 border border-gray-100">
+                <h3 class="font-bold text-gray-700 mb-2">⚠️ 加微接口报错趋势</h3>
+                <div id="chart_wechat" style="width: 100%; height: 260px;"></div>
+            </div>
+        </div>
+
+        <div id="error-alert" class="hidden mt-6 bg-red-50 border-l-4 border-red-500 p-4 rounded text-red-700">
+            <p class="font-bold">获取数据失败</p>
+            <p id="error-msg" class="text-sm"></p>
+        </div>
+    </div>
+
+    <script>
+        let charts = {};
+
+        function initDates() {
+            const today = new Date();
+            const sevenDaysAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
+            const fmt = (d) => d.toISOString().split('T')[0];
+            document.getElementById('end_date').value = fmt(today);
+            document.getElementById('start_date').value = fmt(sevenDaysAgo);
+        }
+
+        // 初始化 6 个 Echarts 容器
+        function initCharts() {
+            charts.cancel = echarts.init(document.getElementById('chart_cancel'));
+            charts.cancel_loss = echarts.init(document.getElementById('chart_cancel_loss')); // 🌟 新增
+            charts.pending = echarts.init(document.getElementById('chart_pending'));
+            charts.success = echarts.init(document.getElementById('chart_success'));
+            charts.schedule = echarts.init(document.getElementById('chart_schedule'));
+            charts.wechat = echarts.init(document.getElementById('chart_wechat'));
+        }
+
+        async function fetchData() {
+            const startDate = document.getElementById('start_date').value;
+            const endDate = document.getElementById('end_date').value;
+            
+            if (!startDate || !endDate) return alert("请选择完整的开始和结束日期！");
+
+            try {
+                const url = `/api/analytics/dashboard-stats?start_date=${startDate}&end_date=${endDate}`;
+                const response = await fetch(url);
+                const result = await response.json();
+
+                if (result.code === 1) {
+                    const data = result.data;
+                    document.getElementById('cancel_count').innerText = data.cancel_count;
+                    document.getElementById('cancel_loss_count').innerText = data.cancel_loss_count; // 🌟 新增
+                    document.getElementById('pending_timeout_count').innerText = data.pending_timeout_count;
+                    document.getElementById('pending_success_count').innerText = data.pending_success_count;
+                    document.getElementById('schedule_fail_count').innerText = data.schedule_fail_count;
+                    document.getElementById('wechat_error_count').innerText = data.wechat_error_count;
+                    document.getElementById('chart_subtitle').innerText = `当前展示数据范围：${data.date_range}`;
+                    document.getElementById('error-alert').classList.add('hidden');
+
+                    renderAllCharts(data.daily_trend);
+                } else {
+                    showError(result.msg || result.message);
+                }
+            } catch (error) {
+                showError("网络请求异常：" + error.message);
+            }
+        }
+
+        function renderAllCharts(trendData) {
+            if (!trendData || trendData.length === 0) {
+                Object.values(charts).forEach(c => c.clear());
+                return;
+            }
+
+            const dates = trendData.map(item => item.date);
+
+            // 分发 6 个图表的数据和样式 (紫色和绿色用虚线表示流失挽回指标)
+            renderSingleChart(charts.cancel, 'Cancel 抽单', dates, trendData.map(i => i.cancel), '#3B82F6', false);
+            renderSingleChart(charts.cancel_loss, '业务抽单致流失', dates, trendData.map(i => i.cancel_loss), '#9333EA', true); // 🌟 新增
+            renderSingleChart(charts.pending, 'Pending 超时', dates, trendData.map(i => i.pending), '#D97706', false);
+            renderSingleChart(charts.success, '倒计时过短流失', dates, trendData.map(i => i.pending_success), '#10B981', true);
+            renderSingleChart(charts.schedule, '次呼排期失败', dates, trendData.map(i => i.schedule_fail), '#EF4444', false);
+            renderSingleChart(charts.wechat, '加微接口报错', dates, trendData.map(i => i.wechat_error), '#991B1B', false);
+        }
+
+        function renderSingleChart(chartInstance, name, dates, dataArray, color, isDashed) {
+            const option = {
+                tooltip: { 
+                    trigger: 'axis',
+                    axisPointer: { type: 'line', lineStyle: { color: 'rgba(0,0,0,0.1)' } }
+                },
+                grid: { left: '2%', right: '4%', bottom: '5%', top: '15%', containLabel: true },
+                xAxis: { 
+                    type: 'category', 
+                    boundaryGap: false, 
+                    data: dates,
+                    axisLabel: { color: '#6B7280', fontSize: 10 },
+                    axisLine: { lineStyle: { color: '#E5E7EB' } }
+                },
+                yAxis: { 
+                    type: 'value',
+                    minInterval: 1, 
+                    splitLine: { lineStyle: { color: '#F3F4F6', type: 'dashed' } },
+                    axisLabel: { color: '#6B7280' }
+                },
+                series: [{ 
+                    name: name, 
+                    type: 'line', 
+                    smooth: true, 
+                    itemStyle: { color: color },
+                    lineStyle: { type: isDashed ? 'dashed' : 'solid', width: 3 },
+                    areaStyle: {
+                        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                            { offset: 0, color: color + '44' }, 
+                            { offset: 1, color: color + '00' }
+                        ])
+                    },
+                    data: dataArray
+                }]
+            };
+            chartInstance.setOption(option, true);
+        }
+
+        function showError(msg) {
+            document.getElementById('error-msg').innerText = msg;
+            document.getElementById('error-alert').classList.remove('hidden');
+        }
+
+        window.addEventListener('resize', () => { Object.values(charts).forEach(c => c.resize()); });
+
+        window.onload = () => {
+            initDates();
+            initCharts();
+            fetchData();
+        };
+    </script>
+</body>
+</html>

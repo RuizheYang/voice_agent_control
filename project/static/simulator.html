@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Webhook 流程模拟器</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f5f7fa; margin: 0; padding: 20px; color: #333; }
+        .container { max-width: 1000px; margin: 0 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .panel { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); }
+        h2 { margin-top: 0; color: #2c3e50; border-bottom: 2px solid #ebebeb; padding-bottom: 10px; }
+        .control-group { margin-bottom: 15px; }
+        .control-group label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input[type="text"] { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; font-family: monospace; font-size: 14px; }
+        button { background-color: #3498db; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 14px; margin-right: 5px; margin-bottom: 10px; transition: background 0.2s; }
+        button:hover { background-color: #2980b9; }
+        .btn-green { background-color: #2ecc71; } .btn-green:hover { background-color: #27ae60; }
+        .btn-purple { background-color: #9b59b6; } .btn-purple:hover { background-color: #8e44ad; }
+        .btn-orange { background-color: #e67e22; } .btn-orange:hover { background-color: #d35400; }
+        .btn-red { background-color: #e74c3c; } .btn-red:hover { background-color: #c0392b; }
+        .status-box { font-size: 24px; font-weight: bold; padding: 15px; text-align: center; border-radius: 4px; background-color: #ecf0f1; color: #2c3e50; transition: all 0.3s ease; }
+        .log-container { height: 300px; overflow-y: auto; background: #2c3e50; color: #ecf0f1; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 13px; }
+        .log-entry { margin-bottom: 5px; border-bottom: 1px solid #34495e; padding-bottom: 5px; }
+        .log-time { color: #f1c40f; } .log-method { color: #2ecc71; } .log-err { color: #e74c3c; }
+        .flex-row { display: flex; gap: 10px; align-items: flex-end; }
+        .hint { font-size: 12px; color: #7f8c8d; margin-top: 5px; }
+        
+        /* 事件溯源相关样式 */
+        .btn-blue { background-color: #2980b9; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 14px; }
+        .btn-blue:hover { background-color: #1f6391; }
+        .events-container { max-height: 400px; overflow-y: auto; padding-right: 5px; }
+        .event-card { background: #f8f9fa; border-left: 4px solid #3498db; margin-bottom: 12px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); overflow: hidden; }
+        .event-header { padding: 8px 12px; background: #ecf0f1; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #dfe6e9; }
+        .event-type { font-weight: bold; color: #2980b9; font-size: 14px; }
+        .event-time { font-size: 12px; color: #7f8c8d; }
+        .event-data { margin: 0; padding: 12px; background: #2c3e50; color: #a3e4d7; font-family: monospace; font-size: 13px; overflow-x: auto; white-space: pre-wrap; word-wrap: break-word; }
+    </style>
+</head>
+<body>
+    <div style="text-align: center; margin-bottom: 20px;">
+        <h1>Webhook 业务流转模拟器</h1>
+        <p>动态生成 Clue ID，发起各类 Webhook 通知，实时观测底层有限状态机的变化情况</p>
+    </div>
+
+    <div class="container">
+        <!-- 左侧：控制面板 -->
+        <div class="panel">
+            <h2>⚙️ 控制面板</h2>
+            
+            <div class="control-group flex-row">
+                <div style="flex-grow: 1;">
+                    <label for="clueIdInput">当前操作的 Clue ID:</label>
+                    <input type="text" id="clueIdInput" value="CLUE_SIM_001" readonly>
+                </div>
+                <div style="flex-grow: 1;">
+                    <label for="phoneInput">用户手机号 (将自动记忆):</label>
+                    <input type="text" id="phoneInput" value="13800138000" placeholder="请输入11位手机号">
+                </div>
+            </div>
+            <button onclick="generateNewClue()" class="btn-purple" style="margin-top: 5px;">🔄 随机换一个 Clue ID</button>
+
+            <div class="control-group" style="margin-top: 25px;">
+                <label>1. 推入线索 (起步创建阶段)</label>
+                <div class="hint">新线索入库。设定不同的推入时间，以测试路由逻辑。</div>
+                <div class="flex-row">
+                    <button onclick="webhookRequest('/clue/new', getNewCluePayloadDay())" class="btn-green">☀️ 模拟白天入库 (/new)</button>
+                    <button onclick="webhookRequest('/clue/new', getNewCluePayloadNight())" class="btn-purple">🌙 模拟夜间入库 (/new)</button>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label>2. 外呼动作阶段拆解 (排队 -> 拨打 -> 挂断)</label>
+                <div class="hint">如果是夜间入库的线索（处于 scheduled 等待明天早上的任务），先点击“定时到达”。<br/>系统向话务平台发起排队推单，线索便会进入 <b>wait_for_calling</b>。</div>
+                
+                <button onclick="webhookRequest('/clue/schedule/notify', getSchedulePayload())" style="width: 100%; margin-top: 5px; margin-bottom: 10px;" class="btn-orange">⏱ 1. 触发定时调度 (scheduled -> wait_for_calling)</button>
+                
+                <div class="hint">当话务平台真正开始给用户拨号时，回调通知系统：</div>
+                <button onclick="webhookRequest('/clue/call-start/notify', getSimplePayload())" style="width: 100%; margin-bottom: 10px;" class="btn-purple">🔊 2. 平台开始实际拨打 (wait_for_calling -> calling)</button>
+                
+                <div style="background: #f8f9fa; padding: 10px; border-radius: 5px; margin-top: 10px; border: 1px solid #eee;">
+                    <div class="flex-row" style="margin-bottom: 5px;">
+                        <span style="font-size: 13px; min-width: 60px;">1级码:</span>
+                        <input type="text" id="oneLevelInput" value="600" style="width: 80px; padding: 4px;">
+                        <span style="font-size: 13px; margin-left: 10px; min-width: 60px;">2级码:</span>
+                        <input type="text" id="twoLevelInput" value="601" style="width: 80px; padding: 4px;">
+                    </div>
+                    <div style="display: flex; gap: 5px;">
+                        <button onclick="webhookRequest('/clue/call-end/notify', getCallEndPayload())" style="margin-bottom: 0;">🛑 电话已挂断打完</button>
+                        <button onclick="simulateConcurrentCallEnd()" class="btn-red" style="margin-bottom: 0;">🧨 相同RequestId双连击(测幂等)</button>
+                    </div>
+                    <div class="hint" style="margin-top: 5px;">常用1级码: 200(已加微), 300(拒绝/不符), 500(未接通/需次呼), 600(顺带加微需Pending)</div>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label>3. 外部通道状态</label>
+                <button onclick="webhookRequest('/clue/channel/notify', getChannelPayload())" class="btn-orange">🟢 企微发送成功通知 (通道回调)</button>
+            </div>
+
+            <div class="control-group">
+                <label>4. 终止类通知</label>
+                <button onclick="webhookRequest('/clue/cancel', getSimplePayload())" class="btn-red">🛑 取消当前线索 (/cancel)</button>
+            </div>
+        </div>
+
+        <!-- 右侧：状态显示与日志 -->
+        <div class="panel">
+            <h2>💡 当前生命周期状态</h2>
+            
+            <div class="control-group">
+                <div id="statusBox" class="status-box">未知状态 (暂未拉取)</div>
+                <div style="text-align: right; margin-top: 5px;">
+                    <small><i>* 每 1.5 秒自动从数据库轮询同步</i></small>
+                </div>
+            </div>
+
+            <div class="control-group" style="margin-top: 25px; border-top: 2px dashed #ebebeb; padding-top: 15px;">
+                <div class="flex-row" style="margin-bottom: 10px; align-items: center;">
+                    <h3 style="margin: 0; color: #2c3e50; flex-grow: 1;">🔍 事件溯源 (Event Sourcing)</h3>
+                    <button onclick="fetchClueEvents()" class="btn-blue" style="margin-bottom: 0;">↻ 刷新事件流水</button>
+                </div>
+                <div id="eventsContainer" class="events-container">
+                    <div style="text-align: center; color: #7f8c8d; font-style: italic; padding: 20px;">暂未加载事件数据，点击刷新读取</div>
+                </div>
+            </div>
+
+            <h2 style="margin-top: 30px;">📜 请求面板日志 (Response Code)</h2>
+            <div id="logContainer" class="log-container">
+                <div class="log-entry"><span class="log-time">[System]</span> 模拟器已就绪。请先推入线索发起流程。</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ------------------ 状态轮询逻辑 ------------------
+        let currentClueId = "CLUE_SIM_" + Math.random().toString(36).substr(2, 6).toUpperCase();
+        document.getElementById('clueIdInput').value = currentClueId;
+
+        // --- 手机号记忆加载与保存 ---
+        const PHONE_STORAGE_KEY = "sim_saved_phone_number";
+        const savedPhone = localStorage.getItem(PHONE_STORAGE_KEY);
+        if (savedPhone) {
+            document.getElementById('phoneInput').value = savedPhone;
+        }
+
+        document.getElementById('phoneInput').addEventListener('input', function(e) {
+            localStorage.setItem(PHONE_STORAGE_KEY, e.target.value.trim());
+        });
+
+        async function forceState(targetState) {
+            writeLog(`<span style="color:red">==> FORCE UPDATE STATE: ${targetState}</span>`);
+            try {
+                const res = await fetch(`/database/update_state?clueId=${currentClueId}&state=${targetState}`, { method: 'POST' });
+                const data = await res.json();
+                writeLog(`&nbsp;&nbsp;&nbsp;<-- Recv: Code ${data.code} | Msg: ${data.message}`);
+                setTimeout(fetchState, 300);
+            } catch (e) {
+                writeLog(`&nbsp;&nbsp;&nbsp;<-- <span class="log-err">Req Error: ${e.message}</span>`);
+            }
+        }
+
+        function generateNewClue() {
+            currentClueId = "CLUE_SIM_" + Math.random().toString(36).substr(2, 6).toUpperCase();
+            document.getElementById('clueIdInput').value = currentClueId;
+            writeLog(`[System] 已换线索 ID 为: <b>${currentClueId}</b>`);
+            fetchState(); // 立即查一次
+            document.getElementById('eventsContainer').innerHTML = '<div style="text-align: center; color: #7f8c8d; font-style: italic; padding: 20px;">该线索为新生成，暂未拉取/无事件数据</div>';
+        }
+
+        async function fetchState() {
+            try {
+                const res = await fetch(`/database/clue_state?clueId=${currentClueId}`);
+                const data = await res.json();
+                const box = document.getElementById('statusBox');
+                box.innerText = data.state;
+                // 添加小动画效果增强感知
+                box.style.opacity = 0.7;
+                setTimeout(() => box.style.opacity = 1, 200);
+            } catch (err) {
+                document.getElementById('statusBox').innerText = "Network Error";
+            }
+        }
+        setInterval(fetchState, 1500);
+        fetchState();
+
+        async function fetchClueEvents() {
+            const container = document.getElementById('eventsContainer');
+            container.innerHTML = '<div style="text-align: center; color: #7f8c8d; padding: 20px;">⏳ 正在拉取溯源数据...</div>';
+            try {
+                const res = await fetch('/database/clue-events', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ clueId: currentClueId })
+                });
+                const responseData = await res.json();
+                
+                if (responseData.code === 1 && responseData.data && responseData.data.length > 0) {
+                    let html = '';
+                    responseData.data.forEach((ev, index) => {
+                        let dataStr = ev.eventData ? JSON.stringify(ev.eventData, null, 2) : '无附加数据';
+                        html += `
+                        <div class="event-card">
+                            <div class="event-header">
+                                <div>
+                                    <span style="color: #7f8c8d; margin-right: 5px; font-size: 13px;">#${index + 1}</span>
+                                    <span class="event-type">${ev.eventType}</span>
+                                </div>
+                                <span class="event-time">${ev.eventTime || '未知时间'}</span>
+                            </div>
+                            <pre class="event-data">${dataStr}</pre>
+                        </div>`;
+                    });
+                    container.innerHTML = html;
+                } else {
+                    container.innerHTML = '<div style="text-align: center; color: #7f8c8d; padding: 20px;">该线索暂无任何流转事件</div>';
+                }
+            } catch (err) {
+                container.innerHTML = `<div style="text-align: center; color: #e74c3c; padding: 20px;">拉取事件失败: ${err.message}</div>`;
+            }
+        }
+
+        // ------------------ 请求发送库 ------------------
+        async function webhookRequest(path, payload) {
+            writeLog(`<span class="log-method">==> POST ${path}</span>`);
+            try {
+                const res = await fetch(path, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                
+                // Code=1: 状态冲突. Code=2: 锁超时. Code=0: 成功. Code=3: 内部报错
+                let colorPrefix = "<span style='color: #2ecc71;'>"; // green
+                if (data.code === 1) colorPrefix = "<span style='color: #f39c12;'>"; // yellow
+                if (data.code === 2) colorPrefix = "<span style='color: #e67e22;'>"; // orange
+                if (data.code === 3) colorPrefix = "<span style='color: #e74c3c;'>"; // red
+                
+                writeLog(`&nbsp;&nbsp;&nbsp;<-- Recv: ${colorPrefix}Code: ${data.code} | Msg: ${data.msg}</span>`);
+            } catch (e) {
+                writeLog(`&nbsp;&nbsp;&nbsp;<-- <span class="log-err">Req Error: ${e.message}</span>`);
+            }
+            // 请求打完触发一下强行刷新状态
+            setTimeout(fetchState, 300);
+        }
+
+        function simulateConcurrentCallEnd() {
+            const payload = getCallEndPayload();
+            writeLog(`<span style="color:#e74c3c"><b>==> 触发并发幂等测试 (重放相同的 RequestId: ${payload.requestId})</b></span>`);
+            // 几乎同时发出两次一模一样的请求
+            webhookRequest('/clue/call-end/notify', payload);
+            setTimeout(() => { webhookRequest('/clue/call-end/notify', payload); }, 100);
+        }
+
+        function writeLog(htmlText) {
+            const container = document.getElementById('logContainer');
+            const time = new Date().toLocaleTimeString();
+            const elm = document.createElement('div');
+            elm.className = 'log-entry';
+            elm.innerHTML = `<span class="log-time">[${time}]</span> ${htmlText}`;
+            container.appendChild(elm);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        // ------------------ Pydantic 模拟数据构造器 ------------------
+        function generateTimeStr(isDaytime) {
+            let offsetDate = new Date();
+            if (isDaytime) {
+                offsetDate.setHours(14); // 下午14点，符合 9~21点
+            } else {
+                offsetDate.setHours(23); // 晚上23点，夜间
+            }
+            let year = offsetDate.getFullYear();
+            let month = String(offsetDate.getMonth() + 1).padStart(2, '0');
+            let day = String(offsetDate.getDate()).padStart(2, '0');
+            let hours = String(offsetDate.getHours()).padStart(2, '0');
+            let minutes = String(offsetDate.getMinutes()).padStart(2, '0');
+            let seconds = String(offsetDate.getSeconds()).padStart(2, '0');
+            return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+        }
+
+        function getNewCluePayloadDay() {
+            return getNewCluePayload(true);
+        }
+
+        function getNewCluePayloadNight() {
+            return getNewCluePayload(false);
+        }
+
+        function getNewCluePayload(isDaytime) {
+            let timeStr = generateTimeStr(isDaytime);
+            
+            // 获取用户填写的手机号（带有简单的校验和持久化保护）
+            let phoneInputVal = document.getElementById('phoneInput').value.trim();
+            if(!phoneInputVal) {
+                phoneInputVal = "13800138000";
+            }
+            
+            return {
+                "workFormId": "SIM_WF_123",
+                "clueId": currentClueId,
+                "clueSource": "simulator",
+                "clueSourceType": "sim_type",
+                "clueType": "test_clue",
+                "clueTime": timeStr,
+                "orderTime": timeStr,
+                "thirdOrderId": "THIRD_123",
+                "customerName": "模拟测试客",
+                "customerPhoneNum": phoneInputVal,
+                "customerCity": "模拟城市",
+                "customerSex": "男",
+                "callBackUrl": "http://localhost:8001/mock",
+                "accessReceiveTime": timeStr,
+                "slots": { "slotCallTts": "voice_v0", "slotCallPolicy": "loan_first_call_agent_v4" },
+                "agentDomainAccount": "mock_agent",
+                "agentAccount": "Mock Agent"
+            };
+        }
+
+        function getSimplePayload() {
+            return { "clueId": currentClueId };
+        }
+
+        function getSchedulePayload() {
+            return {
+                "clueId": currentClueId,
+                "slots": { "slotCallTts": "voice_v0", "slotCallPolicy": "loan_first_call_agent_v4" }
+            };
+        }
+
+        // 暂存上一次成功发出的 Payload，用来测延迟幂等
+        let lastCallEndPayload = null;
+
+        function getCallEndPayload() {
+            let oneCode = document.getElementById('oneLevelInput').value || "200";
+            let twoCode = document.getElementById('twoLevelInput').value || "201";
+            let reqId = "REQ_SIM_" + Math.random().toString(36).substr(2, 8).toUpperCase();
+
+            const payload = {
+                "msgType": "pre_agent",
+                "requestId": reqId,
+                "data": {
+                    "clueId": currentClueId,
+                    "callbackType": "外呼回调",
+                    "outboundReport": {
+                        "checkDetails": {},
+                        "isPhoneNumber": true,
+                        "isUserOperable": true,
+                        "isAngry": false,
+                        "wechatRequested": true,
+                        "wechatAccepted": true,
+                        "memory": "{}",
+                        "oneLevelCode": oneCode, 
+                        "twoLevelCode": twoCode,
+                        "callAnswered": true,
+                        "recordFile": "http://mock.wav"
+                    },
+                    "currentCall": {
+                        "id": 1, "transCode": "T", "transMsg": "T", "calledPhone": "138",
+                        "businessId": "B", "batchId": "B",
+                        "ringingStartTime": 0, "ringingStartTimeDisplay": "d",
+                        "talkStartTime": 0, "talkStartTimeDisplay": "d",
+                        "aiCallCompleteTime": 0, "recordFile": "f",
+                        "resultCode": "200", "resultMsg": "m", "callId": "C_1",
+                        "aiCallSeconds": 30, "aiCallContextList": "[]", "intentionResult": 1,
+                        "extraInfo": "{}", "ringingSeconds": 10, "ringEnterTime": 0,
+                        "provinceCode": "1", "provinceName": "p", "cityCode": "1", "cityName": "c",
+                        "displayNumber": "1", "hangupPart": 1, "aiRealtimeDuplexInteractive": false,
+                        "callSheetId": "s", "gateway": "g", "gatewayName": "g",
+                        "createTime": "t", "updateTime": "t"
+                    },
+                    "historicalCalls": []
+                }
+            };
+            
+            // 每次生成时暂存，给重放按钮用
+            lastCallEndPayload = payload;
+            return payload;
+        }
+
+        function simulateConcurrentCallEnd() {
+            if (!lastCallEndPayload) {
+                writeLog(`<span style="color:#e74c3c"><b>请先随便点击一次普通的【🛑 电话已挂断打完】产生一条历史请求，再点击本按钮！</b></span>`);
+                return;
+            }
+            writeLog(`<span style="color:#e74c3c"><b>==> 触发完全相同的幂等拦截测试 (重放 RequestId: ${lastCallEndPayload.requestId})</b></span>`);
+            
+            // 使用之前暂存的完全一样的 payload 再发一次
+            webhookRequest('/clue/call-end/notify', lastCallEndPayload);
+        }
+
+        function getChannelPayload() {
+            return {
+                "msgType": "pre_agent",
+                "data": {
+                    "type": "notice_addF",
+                    "resultCode": "3", // 代表成功
+                    "custId": currentClueId,
+                    "slots": { "slotCallTts": "", "slotCallPolicy": "" }
+                }
+            };
+        }
+    </script>
+</body>
+</html>
