@@ -267,6 +267,9 @@ class EventBus:
                     pass
 
             metadata = payload.get("metadata") or {}
+            if metadata.get("webhook_dispatched"):
+                logger.debug(f"[EventBus Webhook] 事件已由上游直发，跳过重复推送: clue_id={clue_id}")
+                return
             event_data = payload.get("event_data", {})
 
             webhook_payload = {

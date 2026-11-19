@@ -6,6 +6,22 @@ domain_description: "负责新车车型咨询、试驾预约、全款购车跟�
 voice_agent_id: default
 strategy_id: default
 
+evaluation_mode: single_pass
+work_start_time: "09:00:00"
+work_end_time: "21:00:00"
+
+in_call_flow:
+  initial_node: greeting_triage
+  nodes:
+    greeting_triage:
+      role_message: "你是新车试驾邀约顾问，开场先读取客户跨轮记忆并核实身份与车型兴趣。"
+      transitions:
+        - condition: "客户明确表示预算紧张或询问分期/贷款月供"
+          action: "handoff"
+          target_workflow: "car_loan"
+    test_drive_booking:
+      role_message: "确认客户近期到店试驾时间、偏好的门店区域及同行决策人。"
+
 enabled_sub_evaluators:
   - intent
   - objection

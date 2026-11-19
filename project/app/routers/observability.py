@@ -5,7 +5,7 @@ from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.dbmodels.crud import get_clue_events
-from app.dbmodels.models import CallRecord, ClueInfo
+from app.dbmodels.models import CallRecord, ClueInfo, ExecutionTask
 from app.strategy.contracts import ClueContext
 from app.utils.time_utils import get_now
 
@@ -70,6 +70,13 @@ async def fetch_clue_trace(clueId: str = Query(..., description="线索唯一标
         events = await get_clue_events(clueId)
         events_data = [e.model_dump() for e in events]
 
+        pending_wakeups = await ExecutionTask.filter(
+            clue_id=clueId, task_type="agent_wakeup", status__in=["pending", "retry"]
+        ).order_by("run_at")
+        pending_approvals = await ExecutionTask.filter(
+            clue_id=clueId, task_type="tool_approval", status="pending"
+        ).order_by("create_time")
+
         agent_data = clue.agent_data if isinstance(clue.agent_data, dict) else {}
         detail = {
             "clue_id": clue.clue_id,
@@ -88,6 +95,23 @@ async def fetch_clue_trace(clueId: str = Query(..., description="线索唯一标
             "handoff_history": agent_data.get("handoff_history", []),
             "agent_directive": agent_data.get("agent_directive"),
             "memory": agent_data.get("memory"),
+            "wakeup_timers": [
+                {
+                    "task_id": w.id,
+                    "wake_at": w.run_at.strftime("%Y-%m-%d %H:%M:%S") if w.run_at else None,
+                    "check_goal": (w.payload or {}).get("checkGoal"),
+                }
+                for w in pending_wakeups
+            ],
+            "pending_approvals": [
+                {
+                    "task_id": a.id,
+                    "tool_name": (a.payload or {}).get("tool_name"),
+                    "tool_args": (a.payload or {}).get("tool_args", {}),
+                    "reason": (a.payload or {}).get("reason", ""),
+                }
+                for a in pending_approvals
+            ],
             "create_time": clue.create_time.strftime("%Y-%m-%d %H:%M:%S") if clue.create_time else None,
             "update_time": clue.update_time.strftime("%Y-%m-%d %H:%M:%S") if clue.update_time else None,
             "call_records": call_records_data,

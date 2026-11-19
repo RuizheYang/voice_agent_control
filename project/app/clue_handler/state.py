@@ -11,6 +11,7 @@ class ClueState(str, Enum):
     WAIT_FOR_CALLING = "wait_for_calling" # 已发起呼叫任务，在话务平台中等待呼出
     ERROR = "error" # 错误状态
     SUMMARY = "summary" # Summary推断中
+    AWAITING_APPROVAL = "awaiting_approval" # Deferred Tool Call 挂起等待人工审批
     
     
 VALID_TRANSITIONS = {
@@ -24,13 +25,13 @@ VALID_TRANSITIONS = {
     
     ## 通话状态，结束后可能等待加微成功，可能直接放弃线索，或者直接安排下一次呼叫，或者进入 SUMMARY 推断
     ClueState.CALLING:   [ClueState.PENDING, ClueState.REJECTED, 
-                          ClueState.SCHEDULED, ClueState.ACCEPTED, ClueState.ERROR, ClueState.SUMMARY],
+                          ClueState.SCHEDULED, ClueState.ACCEPTED, ClueState.ERROR, ClueState.SUMMARY, ClueState.AWAITING_APPROVAL],
     
     ## 定时任务状态，到了时间点后准备发起呼叫(CALLING)，或者直接放弃线索/结案
-    ClueState.SCHEDULED: [ClueState.CALLING, ClueState.WAIT_FOR_CALLING, ClueState.REJECTED, ClueState.ACCEPTED],
+    ClueState.SCHEDULED: [ClueState.CALLING, ClueState.WAIT_FOR_CALLING, ClueState.REJECTED, ClueState.ACCEPTED, ClueState.AWAITING_APPROVAL],
     
     ## 等待加微状态，等待通过后可以直接放弃线索，或者添加成功后进入接受状态，或者重试排期
-    ClueState.PENDING:   [ClueState.ACCEPTED, ClueState.REJECTED, ClueState.SCHEDULED], 
+    ClueState.PENDING:   [ClueState.ACCEPTED, ClueState.REJECTED, ClueState.SCHEDULED, ClueState.AWAITING_APPROVAL], 
     
     # 终态：无法再流转到别的状态！
     
@@ -40,6 +41,9 @@ VALID_TRANSITIONS = {
     ## 已经拒绝，线索完成，无法再流转到其他状态了
     ClueState.REJECTED: [],
     
-    ## Summary推断中，成功后流转到PENDING/ACCEPTED等，失败流转到REJECTED，需追呼流转到SCHEDULED
-    ClueState.SUMMARY: [ClueState.PENDING, ClueState.REJECTED, ClueState.ACCEPTED, ClueState.SCHEDULED],
+    ## Summary推断中，成功后流转到PENDING/ACCEPTED等，失败流转到REJECTED，需追呼流转到SCHEDULED，高危工具需人工审批流转到AWAITING_APPROVAL
+    ClueState.SUMMARY: [ClueState.PENDING, ClueState.REJECTED, ClueState.ACCEPTED, ClueState.SCHEDULED, ClueState.AWAITING_APPROVAL],
+
+    ## 人工审批挂起态：批准/驳回后唤醒恢复至 SCHEDULED/PENDING/ACCEPTED/REJECTED
+    ClueState.AWAITING_APPROVAL: [ClueState.ACCEPTED, ClueState.REJECTED, ClueState.SCHEDULED, ClueState.PENDING],
 }

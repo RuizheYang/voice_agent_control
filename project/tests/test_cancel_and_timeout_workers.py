@@ -41,13 +41,8 @@ class TestCancelCallHandler(unittest.IsolatedAsyncioTestCase):
             # 验证延迟队列清理
             self.assertEqual(mock_dq.remove_task.call_count, 4)
 
-            # 验证 Webhook 同步事件回推
-            mock_dispatch_webhook.assert_called_once()
-            webhook_call = mock_dispatch_webhook.call_args.kwargs
-            self.assertEqual(webhook_call["event"], "clue_end")
-            self.assertEqual(webhook_call["clue_id"], clue_id)
-            self.assertEqual(webhook_call["data"]["code"], 300)
-            self.assertEqual(webhook_call["data"]["reason"], close_reason)
+            # V2 修复重复推送 Bug：统一由 EventBus 发射 ClueEndEvent 投递（不再重复直调 dispatch_webhook_event）
+            mock_dispatch_webhook.assert_not_called()
 
             # 验证 EventBus 发射 ClueEndEvent
             mock_emit.assert_called_once()

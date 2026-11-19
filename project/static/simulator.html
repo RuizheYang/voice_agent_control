@@ -93,8 +93,12 @@
             </div>
 
             <div class="control-group">
-                <label>3. 外部通道状态</label>
-                <button onclick="webhookRequest('/clue/channel/notify', getChannelPayload())" class="btn-orange">🟢 企微发送成功通知 (通道回调)</button>
+                <label>3. 外部通道状态 & 通话中实时协同 (V2)</label>
+                <div class="flex-row" style="flex-wrap: wrap;">
+                    <button onclick="webhookRequest('/clue/channel/notify', getChannelPayload())" class="btn-orange">🟢 企微发送成功通知 (/channel/notify)</button>
+                    <button onclick="inCallBootstrap()" class="btn-blue">🎙️ In-Call Bootstrap (拉取记忆与工具)</button>
+                    <button onclick="inCallHandoff()" class="btn-purple">🔀 In-Call 实时切换至 car_loan</button>
+                </div>
             </div>
 
             <div class="control-group">
@@ -391,6 +395,24 @@
                     "slots": { "slotCallTts": "", "slotCallPolicy": "" }
                 }
             };
+        }
+
+        async function inCallBootstrap() {
+            writeLog(`<span class="log-method">==> GET /clue/in-call/${currentClueId}/bootstrap</span>`);
+            try {
+                const res = await fetch(`/clue/in-call/${currentClueId}/bootstrap`);
+                const data = await res.json();
+                writeLog(`&nbsp;&nbsp;&nbsp;<-- Recv: Code: ${data.code || 0} | Workflow: ${data.data?.workflow_id} | Tools: ${(data.data?.visible_tools || []).length}`);
+            } catch (e) {
+                writeLog(`&nbsp;&nbsp;&nbsp;<-- <span class="log-err">Req Error: ${e.message}</span>`);
+            }
+        }
+
+        async function inCallHandoff() {
+            await webhookRequest(`/clue/in-call/${currentClueId}/handoff`, {
+                target_workflow_id: "car_loan",
+                handoff_summary: "模拟器触发：客户通话中询问低息车贷分期方案"
+            });
         }
     </script>
 </body>

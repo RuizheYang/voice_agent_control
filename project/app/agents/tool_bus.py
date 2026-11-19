@@ -176,7 +176,14 @@ async def tool_schedule_followup(
     except Exception:
         parsed_dt = ensure_tz_aware(get_now()) + timedelta(hours=2)
 
-    harness = PolicyHarness(AgentStrategyConfig())
+    harness = PolicyHarness(
+        AgentStrategyConfig(
+            work_start_time=pack.work_start_time,
+            work_end_time=pack.work_end_time,
+            max_touches_per_24h=pack.max_touches_per_24h,
+            workflow_id=pack.workflow_id,
+        )
+    )
     dummy_decision = MasterSummaryDecision(
         status=StandardBusinessStatus.PARTIAL,
         reason=reason,
@@ -477,3 +484,83 @@ def build_domain_toolset(
         .prepared(domain_tool_prepare)
         .approval_required(domain_approval_required)
     )
+
+
+async def execute_tool_by_name(
+    clue_id: str,
+    tool_name: str,
+    tool_args: Optional[Dict[str, Any]] = None,
+    *,
+    workflow_id: Optional[str] = None,
+    bypass_approval: bool = False,
+    dry_run: bool = False,
+    reason: str = "",
+) -> Dict[str, Any]:
+    """
+    通过 ToolBus 统一执行指定工具（供 In-Call 实时控制面与 Deferred Approval 人工批准后恢复调用）。
+    强制经过白名单过滤、CredentialProxy 密钥注入与高危工具审批门禁。
+    """
+    from pydantic_ai.exceptions import ApprovalRequired
+    from app.agents.supervisor import clue_supervisor_agent
+
+    deps = await clue_supervisor_agent.build_runtime_deps(
+        clue_id, workflow_id=workflow_id, dry_run=dry_run
+    )
+    toolset = build_domain_toolset(deps.domain_pack)
+    ctx = RunContext(
+        deps=deps,
+        model=None,  # type: ignore[arg-type]
+        usage=None,  # type: ignore[arg-type]
+        tool_call_approved=bypass_approval,
+    )
+    visible_tools = await toolset.get_tools(ctx)
+    if tool_name not in visible_tools:
+        return {
+            "ok": False,
+            "status": "blocked",
+            "tool": tool_name,
+            "reason": f"工具 '{tool_name}' 未授权于业务线 '{deps.domain_pack.workflow_id}'",
+        }
+
+    args = dict(tool_args or {})
+    tool_obj = visible_tools[tool_name]
+    try:
+        result = await toolset.call_tool(tool_name, args, ctx, tool_obj)
+        return {
+            "ok": True,
+            "status": "executed",
+            "tool": tool_name,
+            "result": result.model_dump(mode="json") if hasattr(result, "model_dump") else result,
+        }
+    except ApprovalRequired:
+        if dry_run:
+            return {
+                "ok": True,
+                "status": "deferred_approval",
+                "dry_run": True,
+                "tool": tool_name,
+                "args": args,
+            }
+        from app.agents.approvals import create_deferred_approval_task
+        approval_task = await create_deferred_approval_task(
+            clue_id=clue_id,
+            workflow_id=deps.domain_pack.workflow_id,
+            tool_name=tool_name,
+            tool_args=args,
+            reason=reason or f"Tool '{tool_name}' requires human approval",
+        )
+        return {
+            "ok": True,
+            "status": "deferred_approval",
+            "approval_task_id": approval_task.id,
+            "tool": tool_name,
+            "args": args,
+        }
+    except Exception as err:
+        logger.warning(f"[ToolBus] 执行工具 {tool_name} 失败 (clue_id={clue_id}): {err}")
+        return {
+            "ok": False,
+            "status": "error",
+            "tool": tool_name,
+            "error": f"{type(err).__name__}: {err}",
+        }

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, time, timezone
 from enum import Enum
 from time import perf_counter
-from typing import Any
+from typing import Any, Dict, Optional
 from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo
 
@@ -133,7 +133,7 @@ class AgentConfigurationPending(Exception):
     """Agent配置来源或必要的话务映射未准备好，任务应延期而不是结束线索。"""
 
 
-def _validate_agent_config(agent_id, agent_config):
+def _validate_agent_config(agent_id, agent_config, *, gateway_mode: Optional[str] = None):
     """校验送号需要的Agent配置，返回明确配置的speechcraftId。"""
     if not isinstance(agent_config, dict) or agent_config.get("agent_id") != agent_id:
         raise AgentConfigurationPending("agent_config_missing")
@@ -147,9 +147,45 @@ def _validate_agent_config(agent_id, agent_config):
     settings = agent_config.get("global_settings")
     tts = settings.get("tts") if isinstance(settings, dict) else None
     speechcraft_id = tts.get("provider_id") if isinstance(tts, dict) else None
+    mode = (gateway_mode or os.getenv("TELEPHONY_GATEWAY_MODE") or "").strip().lower()
     if not isinstance(speechcraft_id, str) or not speechcraft_id.strip():
+        if mode in ("livekit", "pipecat"):
+            return f"realtime_{agent_id}"
         raise AgentConfigurationPending("agent_tts_provider_pending")
     return speechcraft_id
+
+
+def render_dynamic_agent_context(
+    agent_config: Optional[Dict[str, Any]],
+    agent_data: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    将 4 桶结构化记忆与上轮 Agent 指令 (agent_directive) 动态渲染进下一轮话务指令与开场白，
+    确保下轮语音通话具备跨轮次记忆与实时情景感知。
+    """
+    from app.agents.memory_dreamer import MemoryDreamer
+
+    data = dict(agent_data or {})
+    memory = MemoryDreamer.load_memory(data)
+    memory_index = memory.to_compact_index()
+    directive = str(data.get("agent_directive") or memory.instructions or "").strip()
+
+    settings = (agent_config or {}).get("global_settings") or {}
+    base_instruction = str(settings.get("instruction") or (agent_config or {}).get("instruction") or "").strip()
+    open_message = str((agent_config or {}).get("open_message") or "").strip()
+
+    dynamic_parts = [p for p in [base_instruction] if p]
+    if memory_index:
+        dynamic_parts.append(f"[客户跨轮记忆索引]\n{memory_index}")
+    if directive:
+        dynamic_parts.append(f"[本轮外呼攻坚指引]\n{directive}")
+
+    return {
+        "memoryIndex": memory_index,
+        "agentDirective": directive,
+        "dynamicInstruction": "\n\n".join(dynamic_parts),
+        "openMessage": open_message,
+    }
 
 
 async def load_agent_config(agent_id, sip):
@@ -182,6 +218,11 @@ def as_utc(value):
 
 
 def build_telephony_params(record, agent_config, *, now, line_type: LineType):
+    from app.strategy.agent_driven.tools import (
+        is_within_working_window,
+        resolve_working_window,
+        working_window_end_for_date,
+    )
     line_type = LineType(line_type)
     speechcraft_id = _validate_agent_config(record.agent_id, agent_config)
     snapshot = record.config_snapshot
@@ -200,15 +241,23 @@ def build_telephony_params(record, agent_config, *, now, line_type: LineType):
     from app.utils.decrypt import crypted_manager
     phone = crypted_manager.decrypt_field(snapshot["phoneNumber"])
     local = as_utc(now).astimezone(ZoneInfo(config.get("timezone", "Asia/Shanghai")))
-    end = datetime.combine(local.date(), time(21), local.tzinfo)
+    work_start, work_end = resolve_working_window(config)
+    end = working_window_end_for_date(local, work_end)
     if snapshot.get("expiresAt"):
         end = min(end, as_utc(datetime.fromisoformat(snapshot["expiresAt"])).astimezone(local.tzinfo))
-    if not 9 <= local.hour < 21 or end <= local:
+    if not is_within_working_window(local, work_start, work_end) or end <= local:
         raise ValueError("outside call window")
-    context = {"clueId": record.clue_id, "callId": record.call_id, "batchId": batch_id_for_call(record.call_id),
-               "agentId": record.agent_id,
-               "agentVersion": agent_config["version"], "agentData": data,
-               "overrides": copy.deepcopy(config.get("voiceOverrides") or {})}
+    rendered = render_dynamic_agent_context(agent_config, data)
+    context = {
+        "clueId": record.clue_id,
+        "callId": record.call_id,
+        "batchId": batch_id_for_call(record.call_id),
+        "agentId": record.agent_id,
+        "agentVersion": agent_config["version"],
+        "agentData": data,
+        "overrides": copy.deepcopy(config.get("voiceOverrides") or {}),
+        **rendered,
+    }
     return TelephonyAPI(
         accessorId=sip["accessorId"],
         strategyId=requested_line, speechcraftId=speechcraft_id,
@@ -532,11 +581,171 @@ class GenericWebhookGateway(BaseTelephonyGateway):
         return SubmitResult("unknown", "submission_unconfirmed")
 
 
+class LiveKitTelephonyGateway(BaseTelephonyGateway):
+    """
+    LiveKit Agents + SIP 外呼网关适配器:
+    对齐 LiveKit 两阶段外呼范式 (CreateAgentDispatch + CreateSIPParticipant)，
+    将四桶记忆索引、动态指令与 In-Call 控制面 Bootstrap 地址注入 Room Metadata。
+    """
+
+    def build_dispatch_payload(self, record: Any) -> Dict[str, Any]:
+        snapshot = getattr(record, "config_snapshot", None) or {}
+        agent_data = snapshot.get("agentData") or {}
+        agent_config = snapshot.get("agentConfig") or {}
+        rendered = render_dynamic_agent_context(agent_config, agent_data)
+
+        phone = snapshot.get("phoneNumber", "")
+        if phone and len(str(phone)) > 20:
+            try:
+                from app.utils.decrypt import crypted_manager
+                phone = crypted_manager.decrypt_field(phone)
+            except Exception:
+                pass
+
+        room_name = f"clue-{record.clue_id}-{record.call_id}"
+        trunk_id = os.getenv("LIVEKIT_SIP_TRUNK_ID", "").strip()
+        control_base = os.getenv("CONTROL_PLANE_BASE_URL", "http://localhost:8001").rstrip("/")
+        metadata = {
+            "clue_id": record.clue_id,
+            "call_id": record.call_id,
+            "agent_id": record.agent_id,
+            "strategy_id": record.strategy_id,
+            "bootstrap_url": f"{control_base}/clue/in-call/{record.clue_id}/bootstrap",
+            "tool_invoke_url": f"{control_base}/clue/in-call/{record.clue_id}/tool-invoke",
+            "handoff_url": f"{control_base}/clue/in-call/{record.clue_id}/handoff",
+            **rendered,
+        }
+        return {
+            "room_name": room_name,
+            "agent_name": os.getenv("LIVEKIT_AGENT_NAME", record.agent_id or "outbound-voice-agent"),
+            "sip_trunk_id": trunk_id,
+            "sip_call_to": phone,
+            "metadata": metadata,
+        }
+
+    async def submit_call(self, record: Any) -> SubmitResult:
+        from app.config import call_schedule_settings as settings
+
+        dispatch_url = os.getenv("LIVEKIT_DISPATCH_BRIDGE_URL", "").strip() or get_sender_url()
+        if not dispatch_url:
+            return SubmitResult("deferred", "livekit_endpoint_missing")
+        if not valid_endpoint(dispatch_url):
+            return SubmitResult("deferred", "invalid_livekit_endpoint")
+
+        before_send = getattr(record, "before_send", None)
+        if before_send is not None and not await before_send():
+            return SubmitResult("deferred", "submission_gate_closed")
+
+        payload = self.build_dispatch_payload(record)
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=settings.http_timeout_seconds)) as session:
+            try:
+                async with session.post(url=dispatch_url, json=payload, allow_redirects=False) as response:
+                    raw_body = await response.text()
+                    try:
+                        body = json.loads(raw_body)
+                    except ValueError:
+                        body = None
+                    res = classify_response(response.status, body)
+                    if res.status == "accepted" and not res.provider_call_id:
+                        return SubmitResult("accepted", "livekit_dispatched", provider_call_id=payload["room_name"])
+                    return res
+            except aiohttp.ClientConnectorError:
+                return SubmitResult("retry", "connection_failed")
+            except (asyncio.TimeoutError, aiohttp.ClientError, UnicodeError):
+                return SubmitResult("unknown", "transport_unknown")
+
+    async def reconcile_call(self, record: Any) -> SubmitResult:
+        return SubmitResult("unknown", "livekit_reconcile_requires_webhook")
+
+
+class PipecatTelephonyGateway(BaseTelephonyGateway):
+    """
+    Pipecat + Pipecat Flows 外呼网关适配器:
+    将 BusinessDomainPack.in_call_flow 节点状态机、四桶记忆索引与 In-Call 工具代理端点下发至 Pipecat Bot 服务。
+    """
+
+    async def build_session_payload(self, record: Any) -> Dict[str, Any]:
+        snapshot = getattr(record, "config_snapshot", None) or {}
+        agent_data = snapshot.get("agentData") or {}
+        agent_config = snapshot.get("agentConfig") or {}
+        rendered = render_dynamic_agent_context(agent_config, agent_data)
+
+        phone = snapshot.get("phoneNumber", "")
+        if phone and len(str(phone)) > 20:
+            try:
+                from app.utils.decrypt import crypted_manager
+                phone = crypted_manager.decrypt_field(phone)
+            except Exception:
+                pass
+
+        in_call_flow = None
+        try:
+            from app.agents.domain_registry import domain_pack_registry
+            from app.dbmodels import crud
+            clue = await crud.get_clue_info(record.clue_id)
+            wf_id = clue.workflow_id if clue else "default"
+            pack = await domain_pack_registry.get_pack(wf_id)
+            in_call_flow = pack.in_call_flow
+        except Exception:
+            pass
+
+        control_base = os.getenv("CONTROL_PLANE_BASE_URL", "http://localhost:8001").rstrip("/")
+        return {
+            "clue_id": record.clue_id,
+            "call_id": record.call_id,
+            "called_phone": phone,
+            "agent_id": record.agent_id,
+            "flow_config": in_call_flow,
+            "bootstrap_url": f"{control_base}/clue/in-call/{record.clue_id}/bootstrap",
+            "tool_invoke_url": f"{control_base}/clue/in-call/{record.clue_id}/tool-invoke",
+            "handoff_url": f"{control_base}/clue/in-call/{record.clue_id}/handoff",
+            **rendered,
+        }
+
+    async def submit_call(self, record: Any) -> SubmitResult:
+        from app.config import call_schedule_settings as settings
+
+        pipecat_url = os.getenv("PIPECAT_OUTBOUND_URL", "").strip() or get_sender_url()
+        if not pipecat_url:
+            return SubmitResult("deferred", "pipecat_endpoint_missing")
+        if not valid_endpoint(pipecat_url):
+            return SubmitResult("deferred", "invalid_pipecat_endpoint")
+
+        before_send = getattr(record, "before_send", None)
+        if before_send is not None and not await before_send():
+            return SubmitResult("deferred", "submission_gate_closed")
+
+        payload = await self.build_session_payload(record)
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=settings.http_timeout_seconds)) as session:
+            try:
+                async with session.post(url=pipecat_url, json=payload, allow_redirects=False) as response:
+                    raw_body = await response.text()
+                    try:
+                        body = json.loads(raw_body)
+                    except ValueError:
+                        body = None
+                    res = classify_response(response.status, body)
+                    if res.status == "accepted" and not res.provider_call_id:
+                        return SubmitResult("accepted", "pipecat_dispatched", provider_call_id=f"pc_{record.call_id}")
+                    return res
+            except aiohttp.ClientConnectorError:
+                return SubmitResult("retry", "connection_failed")
+            except (asyncio.TimeoutError, aiohttp.ClientError, UnicodeError):
+                return SubmitResult("unknown", "transport_unknown")
+
+    async def reconcile_call(self, record: Any) -> SubmitResult:
+        return SubmitResult("unknown", "pipecat_reconcile_requires_webhook")
+
+
 def resolve_telephony_gateway() -> BaseTelephonyGateway:
-    """根据配置解析生效的话务网关实现（支持 mock 与 webhook）"""
+    """根据配置解析生效的话务网关实现（支持 mock / webhook / livekit / pipecat）"""
     from app.config import config
 
     mode = (os.getenv("TELEPHONY_GATEWAY_MODE") or config.call_request_config.gateway_mode or "mock").strip().lower()
+    if mode == "livekit":
+        return LiveKitTelephonyGateway()
+    if mode == "pipecat":
+        return PipecatTelephonyGateway()
     if mode == "mock" or (config.bypass_call and not get_sender_url()):
         return MockTelephonyGateway()
     return GenericWebhookGateway()

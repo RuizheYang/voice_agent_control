@@ -22,13 +22,8 @@ def ensure_tz_aware(dt: Optional[datetime], default_tz=LOCAL_TZ) -> Optional[dat
 def get_now() -> datetime:
     """
     【系统中央时钟】
-    获取当前系统的标准时间。永远返回 Naive Datetime (不带时区，但数值是北京时间)。
+    获取当前系统的标准时间，统一返回带 Asia/Shanghai 时区的 Aware Datetime。
     """
-    # 1. 获取绝对准确的当前 UTC 时间
     utc_now = datetime.now(ZoneInfo("UTC"))
-    
-    # 2. 转换为东八区时间
-    cst_now = utc_now.astimezone(LOCAL_TZ)
-    
-    return cst_now
+    return utc_now.astimezone(LOCAL_TZ)
 

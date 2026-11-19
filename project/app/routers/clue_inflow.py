@@ -20,7 +20,6 @@ from app.schemas.clue_create import (
     ClueCreateRequest,
     ClueCreateResponse,
     BatchClueCreateRequest,
-    NormalizedClue,
 )
 from app.dbmodels.crud import (
     get_workflow_config,
@@ -28,7 +27,6 @@ from app.dbmodels.crud import (
     get_voice_agent_config,
     get_strategy_config,
 )
-from app.clue_handler.factory import ClueHandlerFactory
 from app.clue_inflow import InflowError
 from app.clue_inflow.service import InflowService
 from app.schemas.clue_inflow import BatchInflowRequest, FileInflowRequest, SingleInflowRequest
@@ -250,35 +248,22 @@ async def create_single_clue(request: Request):
         request.state.inflow_workflow_id = clue_req.workflow_id
 
     # 2. 签名与权限验证
-    await verify_inflow_signature(
+    app_id = await verify_inflow_signature(
         request=request,
         raw_body=raw_body_str,
         workflow_id=clue_req.workflow_id
     )
+    allowed_workflows = getattr(getattr(request, "state", None), "allowed_workflows", ["*"]) or ["*"]
 
     # 3. 幂等性校验
     await check_and_lock_request_id(clue_req.request_id)
 
-    # 4. 规范化并推入系统处理 (直接绑定 workflow_config 的 agent_id 与 strategy_id)
-    normalized = clue_req.to_normalized(
-        agent_id=workflow_config.agent_id,
-        strategy_id=workflow_config.strategy_id,
+    # 4. 统一收敛到 InflowService: 单事务落库 ExecutionTask(import) + ClueInfo + ExecutionTask(new_clue)
+    return await get_inflow_service().accept_clue_create(
+        app_id=app_id,
+        clue_req=clue_req,
+        allowed_workflows=allowed_workflows,
     )
-    handler = await ClueHandlerFactory.get_handler_by_workflow(clue_req.workflow_id)
-    clue_record = await handler.on_clue_pushed(normalized)
-
-    workflow_instance_id = clue_record.workflow_instance_id
-    logger.info(f"✅ 线索受理成功: clue_id={normalized.clueId}, wi={workflow_instance_id}, workflow={clue_req.workflow_id}")
-
-    return {
-        "code": 0,
-        "msg": "success",
-        "data": {
-            "inflow_type": "single",
-            "workflow_instance_id": workflow_instance_id,
-            "status": "accepted"
-        }
-    }
 
 
 @router.post("/create/batch", summary="批量线索流入")
@@ -332,51 +317,22 @@ async def create_batch_clues(request: Request):
         request.state.inflow_workflow_id = batch_req.workflow_id
 
     # 2. 签名与权限验证
-    await verify_inflow_signature(
+    app_id = await verify_inflow_signature(
         request=request,
         raw_body=raw_body_str,
         workflow_id=batch_req.workflow_id
     )
+    allowed_workflows = getattr(getattr(request, "state", None), "allowed_workflows", ["*"]) or ["*"]
 
     # 3. 幂等性校验
     await check_and_lock_request_id(batch_req.request_id)
 
-    # 4. 批量推入队列 (直接绑定 workflow 的 agent_id 与 strategy_id)
-    handler = await ClueHandlerFactory.get_handler_by_workflow(batch_req.workflow_id)
-    accepted_count = 0
-
-    for rec in batch_req.records:
-        variables = (rec.agent_data.get("variables", {}) if isinstance(rec.agent_data, dict) else {}) or {}
-        normalized = NormalizedClue(
-            clueId=rec.clue_id,
-            phoneNumber=rec.phone_number,
-            workflowId=batch_req.workflow_id,
-            agentId=workflow_config.agent_id,
-            strategyId=workflow_config.strategy_id,
-            externalTaskId=rec.external_task_id,
-            requestId=batch_req.request_id,
-            customerName=variables.get("name"),
-            customerSex=variables.get("sex"),
-            customerCity=variables.get("city"),
-            agentData=rec.agent_data or {},
-        )
-        try:
-            await handler.on_clue_pushed(normalized)
-            accepted_count += 1
-        except Exception as e:
-            logger.error(f"[BatchInflow] 入库线索 {rec.clue_id} 失败: {e}")
-
-    logger.info(f"✅ 批量线索受理完成: accepted={accepted_count}/{len(batch_req.records)}")
-
-    return {
-        "code": 0,
-        "msg": "accepted",
-        "data": {
-            "inflow_type": "batch",
-            "accepted_count": accepted_count,
-            "rejected_count": len(batch_req.records) - accepted_count
-        }
-    }
+    # 4. 统一收敛到 InflowService: 单事务落库 ExecutionTask(import) + ClueInfo + ExecutionTask(new_clue)
+    return await get_inflow_service().accept_batch_create(
+        app_id=app_id,
+        batch_req=batch_req,
+        allowed_workflows=allowed_workflows,
+    )
 
 
 @router.post("/create/file", summary="文件线索异步流入", status_code=202)

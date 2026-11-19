@@ -410,18 +410,22 @@ class TestAgentAndStrategyCreation(unittest.IsolatedAsyncioTestCase):
     # =========================================================================
 
     def test_legacy_inflow_routes_removed_and_schedule_compatibility_retained(self):
-        """旧流入入口下线，三个新入口及仅补投持久任务的排期兼容入口保留。"""
+        """旧流入入口下线，三个新入口、渠道回调及 In-Call 实时路由已挂载。"""
         all_routes = app.openapi()["paths"]
         self.assertNotIn("/clue/new", all_routes)
         self.assertNotIn("/clue/new/queue", all_routes)
-        self.assertNotIn("/clue/channel/notify", all_routes)
         self.assertNotIn("/clue/schedule/notify", all_routes)
 
-        # 核心通话挂机回调与新创建接口均正常在注册路由中
+        # 核心通话挂机回调、渠道回调与 In-Call 控制面均正常在注册路由中
         self.assertIn("/clue/create", all_routes)
         self.assertIn("/clue/create/batch", all_routes)
         self.assertIn("/clue/create/file", all_routes)
         self.assertIn("/clue/call-end/notify", all_routes)
+        self.assertIn("/clue/channel/notify", all_routes)
+        self.assertIn("/clue/in-call/{clue_id}/bootstrap", all_routes)
+        self.assertIn("/clue/in-call/{clue_id}/tool-invoke", all_routes)
+        self.assertIn("/clue/in-call/{clue_id}/handoff", all_routes)
+        self.assertIn("/api/approvals/pending", all_routes)
         self.assertIn("/voice-agent/create", all_routes)
         self.assertIn("/strategy/create", all_routes)
 

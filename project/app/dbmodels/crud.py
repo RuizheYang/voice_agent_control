@@ -123,6 +123,28 @@ async def create_clue(clue: NormalizedClue) -> ClueInfo:
             if clue_config:
                 clue_record.clue_config = clue_config
             await clue_record.save(using_db=connection)
+        else:
+            # 事务发件箱兜底：同一事务写入 new_clue 恢复任务，确保即使 Redis push 失败也可自动入池
+            entry_key = hashlib.sha256(
+                json.dumps(["new_clue", clue_record.workflow_instance_id]).encode("utf-8")
+            ).hexdigest()
+            try:
+                await ExecutionTask.create(
+                    using_db=connection,
+                    task_key=entry_key,
+                    task_type="new_clue",
+                    clue_id=clue_record.clue_id,
+                    app_id=clue_record.source_app_id,
+                    request_id=clue.requestId,
+                    workflow_id=clue_record.workflow_id,
+                    strategy_id=clue_record.strategy_id,
+                    payload={"importTaskId": 0},
+                    result={"entryStatus": "pending"},
+                    status="pending",
+                    run_at=received_at,
+                )
+            except IntegrityError:
+                pass
 
     return clue_record
 

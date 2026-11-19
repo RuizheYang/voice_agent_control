@@ -17,20 +17,25 @@ from app.strategy.agent_driven.evaluators import SubPromptEvaluatorsPipeline
 from app.strategy.agent_driven.synthesizer import MasterDecisionSynthesizer
 from app.strategy.agent_driven.harness import PolicyHarness
 from app.strategy.agent_driven.fallback import HeuristicSafetyFallbackEngine
-from app.strategy.agent_driven.tools import snap_to_working_window, is_within_working_window
+from app.strategy.agent_driven.tools import (
+    format_conversation_for_prompt,
+    snap_to_working_window,
+    is_within_working_window,
+)
 from app.utils.time_utils import get_now, ensure_tz_aware
 
 logger = logging.getLogger(__name__)
 
+_NON_CONNECTED_OUTCOMES = {"no_answer", "busy", "rejected", "voicemail", "invalid_number", "error", "unanswered"}
+
 
 class AgentDrivenStrategyEngine(BaseStrategyEngine):
     """
-    完全由 Agent 驱动的智能策略排期引擎 (AgentDrivenStrategyEngine)
-    包含：
-    1. 垂直业务专家 Prompt 并发思考流水线 (Map 阶段)
-    2. 主控汇总决策 Prompt 统揽分析 (Reduce 阶段，输出标准 4 态)
-    3. 强护栏约束 Harness (走廊容差约束、原话证据核验、法定工时安全吸附)
-    4. 双轨 5s 毫秒级启发式容灾降级 (方案 A)
+    自适应分层 Agent 驱动策略排期引擎 (Adaptive Tiered AgentDrivenStrategyEngine):
+    - Tier 0 (物理短路, <1ms, 0 LLM 调用): 未接通/占线/空号/无对话记录时直接走确定性未接追呼规则与护栏，消除 70% 无效 Token 消耗。
+    - Tier 1 (Single-Pass 统一推理, 默认): 挂载 ClueSupervisorAgent + Guarded ToolBus，单次调用完成维度提取、工具执行、审批挂起与 4 态决策。
+    - Tier 2 (Parallel Map-Reduce): 并发子评估器 + 主控汇总决策 (按卡带 evaluation_mode='map_reduce' 开启)。
+    - Tier 3 (PolicyHarness + 5s 容灾降级): 原话证据核验、走廊钳位、工时安全吸附与 1ms 启发式降级。
     """
 
     def __init__(
@@ -42,6 +47,7 @@ class AgentDrivenStrategyEngine(BaseStrategyEngine):
         fallback: Optional[HeuristicSafetyFallbackEngine] = None,
     ):
         self._config = config or AgentStrategyConfig()
+        self._custom_pipeline_injected = (evaluators is not None or synthesizer is not None)
         self.evaluators = evaluators or SubPromptEvaluatorsPipeline()
         self.synthesizer = synthesizer or MasterDecisionSynthesizer(self._config)
         self.harness = harness or PolicyHarness(self._config)
@@ -70,7 +76,6 @@ class AgentDrivenStrategyEngine(BaseStrategyEngine):
                 except Exception:
                     pass
 
-        # 兼容 common_call_events 或其他对话字段
         if isinstance(latest, dict):
             return latest.get("conversation", []) or []
         return []
@@ -102,6 +107,55 @@ class AgentDrivenStrategyEngine(BaseStrategyEngine):
             "duration_seconds": duration,
             "telephony_outcome": outcome,
         }
+
+    def _should_short_circuit_tier0(
+        self,
+        telephony_facts: Dict[str, Any],
+        turns: List[Dict[str, Any]],
+    ) -> bool:
+        """Tier 0 物理短路判定：电话未接通且无有效对话文本时，零 LLM 调用直接走确定性规则"""
+        is_connected = telephony_facts["answered"]
+        outcome = str(telephony_facts.get("telephony_outcome") or "").lower()
+        if not is_connected and len(turns) == 0:
+            return True
+        if outcome in _NON_CONNECTED_OUTCOMES and len(turns) < 2 and not is_connected:
+            return True
+        return False
+
+    def _build_single_pass_prompt(
+        self,
+        turns: List[Dict[str, Any]],
+        context_data: Dict[str, Any],
+    ) -> str:
+        """构造 Single-Pass 复合提示词：在单次推理中兼顾内置/声明式维度提取与 ToolBus 调用"""
+        conversation_text = format_conversation_for_prompt(turns)
+        custom_specs = getattr(self._config, "custom_evaluators", []) or []
+        custom_guide = ""
+        if custom_specs:
+            lines = []
+            for spec in custom_specs:
+                name = spec.get("name") if isinstance(spec, dict) else getattr(spec, "name", "")
+                prompt = spec.get("prompt") if isinstance(spec, dict) else getattr(spec, "prompt", "")
+                fields = spec.get("output_fields") if isinstance(spec, dict) else getattr(spec, "output_fields", {})
+                lines.append(f"- {name}: {prompt} (请将结果写入 custom_evaluator_findings['{name}'], 字段={fields})")
+            custom_guide = "\n【业务专属提取维度 (custom_evaluator_findings)】：\n" + "\n".join(lines)
+
+        handoff_targets = context_data.get("allowed_handoff_targets") or []
+        handoff_desc = ", ".join(handoff_targets) if handoff_targets else "无 (禁止 handoff)"
+
+        return (
+            f"请基于本次外呼事实与对话转写，结合你的业务工具集完成分析与排期决策 (输出 MasterSummaryDecision)：\n"
+            f"- 当前系统基准时间: {context_data['reference_time']}\n"
+            f"- 线索总呼叫次数: {context_data['total_calls']} (今日: {context_data['today_calls']}), "
+            f"连续未接: {context_data['continuous_no_answer']}\n"
+            f"- 物理话务结果: {context_data['telephony_outcome']} ({context_data['answered_str']}, "
+            f"时长 {context_data['duration_seconds']}s)\n"
+            f"- 合法外呼工时窗口: {self._config.work_start_time} - {self._config.work_end_time}\n"
+            f"- 线索结构化记忆索引: {context_data['memory_index']}\n"
+            f"- 允许切换下游业务: {handoff_desc}\n"
+            f"{custom_guide}\n\n"
+            f"【本轮对话记录】：\n{conversation_text}"
+        )
 
     async def calculate(self, context: ClueContext) -> ScheduleResult:
         """
@@ -137,7 +191,6 @@ class AgentDrivenStrategyEngine(BaseStrategyEngine):
                     voice_agent_directive="新线索首呼，按约定时间致电客户。",
                 )
 
-            # 工作时间内即时首呼，非工作时间顺延至次日开工
             if is_within_working_window(ref_time, self._config.work_start_time, self._config.work_end_time):
                 immediate_time = ref_time + timedelta(seconds=10)
                 logger.info(f"[AgentDrivenStrategyEngine] 工作时间内新线索即刻外呼: {immediate_time}")
@@ -164,11 +217,22 @@ class AgentDrivenStrategyEngine(BaseStrategyEngine):
                 )
 
         # ------------------------------------------------------------------
-        # 2. 话后追呼与多 Prompt 智能决策 (Post-Call Stage)
+        # 2. Tier 0 物理短路层 (未接通且无对话，0 次 LLM 调用，<1ms)
         # ------------------------------------------------------------------
         turns = self._extract_conversation_turns(context)
         telephony_facts = self._extract_telephony_facts(context)
         is_connected = telephony_facts["answered"]
+
+        if self._should_short_circuit_tier0(telephony_facts, turns):
+            logger.info(
+                f"[AgentDrivenStrategyEngine] 【Tier 0 物理短路】clue_id={clue_id} 未接通且无对话，"
+                f"跳过 6 次 LLM 推理直接走确定性兜底排期"
+            )
+            return self.fallback.generate_fallback_decision(
+                context=context,
+                is_connected=False,
+                error_reason="Tier0物理未接通短路降级(0 LLM调用)",
+            )
 
         # 构造上下文数据
         context_data = {
@@ -185,24 +249,43 @@ class AgentDrivenStrategyEngine(BaseStrategyEngine):
             "allowed_handoff_targets": getattr(self._config, "allowed_handoff_targets", []),
         }
 
-        # 尝试走完整 Agent 推理流水线 (带 5.0 秒超时控制，方案 A 约束)
+        # ------------------------------------------------------------------
+        # 3. Tier 1 (Single-Pass + ToolBus) / Tier 2 (Map-Reduce) 智能推演 + Tier 3 护栏
+        # ------------------------------------------------------------------
         try:
-            # 步骤 A: 垂直业务子场景 Prompt 并发思考 (Map 阶段)
-            sub_outputs = await self.evaluators.evaluate_all(
-                messages=turns,
-                reference_time=context_data["reference_time"],
-                enabled_types=self._config.enabled_sub_prompts,
-                custom_evaluators=getattr(self._config, "custom_evaluators", None),
-            )
+            mode = getattr(self._config, "evaluation_mode", "single_pass")
+            decision: Optional[MasterSummaryDecision] = None
 
-            # 步骤 B: 主控汇总决策 Prompt 综合统筹 (Reduce 阶段)
-            decision: MasterSummaryDecision = await self.synthesizer.synthesize(
-                sub_outputs=sub_outputs,
-                context_data=context_data,
-                timeout=self._config.timeout_seconds,
-            )
+            if mode == "single_pass" and not self._custom_pipeline_injected:
+                try:
+                    from app.agents.supervisor import clue_supervisor_agent
+                    single_prompt = self._build_single_pass_prompt(turns, context_data)
+                    decision = await clue_supervisor_agent.run_single_pass_postcall(
+                        clue_id=clue_id,
+                        prompt=single_prompt,
+                        workflow_id=getattr(self._config, "workflow_id", "default"),
+                        dry_run=(clue_id == "dry_run_clue"),
+                        timeout=self._config.timeout_seconds,
+                    )
+                except RuntimeError:
+                    # 模型未配置时转入 Tier 2/Fallback 统一处理
+                    decision = None
 
-            # 步骤 C: 强护栏 Policy Harness 偏航拦截与安全吸附
+            if decision is None:
+                # Tier 2: Parallel Map-Reduce (或注入了自定义 evaluators/synthesizer)
+                sub_outputs = await self.evaluators.evaluate_all(
+                    messages=turns,
+                    reference_time=context_data["reference_time"],
+                    enabled_types=self._config.enabled_sub_prompts,
+                    custom_evaluators=getattr(self._config, "custom_evaluators", None),
+                )
+                decision = await self.synthesizer.synthesize(
+                    sub_outputs=sub_outputs,
+                    context_data=context_data,
+                    timeout=self._config.timeout_seconds,
+                )
+
+            # Tier 3: 强护栏 Policy Harness 偏航拦截与安全吸附
             result: ScheduleResult = self.harness.evaluate_and_snap(
                 decision=decision,
                 context=context,

@@ -6,6 +6,22 @@ domain_description: "负责购车分期贷款方案测算、首付比例规划�
 voice_agent_id: default
 strategy_id: default
 
+evaluation_mode: single_pass
+work_start_time: "09:00:00"
+work_end_time: "21:00:00"
+
+in_call_flow:
+  initial_node: loan_consultation
+  nodes:
+    loan_consultation:
+      role_message: "你是汽车金融车贷专员，解答首付比例、低息利率与月供问题，可实时调用 tool_calc_loan_plan 测算方案。"
+      functions:
+        - tool_calc_loan_plan
+      transitions:
+        - condition: "客户明确表示改为全款购车不需要分期"
+          action: "handoff"
+          target_workflow: "new_car_sales"
+
 enabled_sub_evaluators:
   - intent
   - objection

@@ -324,10 +324,20 @@ async def test_wakeup_timer_and_channel_cancellation():
     assert old_t.status == "cancelled"
 
     # 微信通过通知到达，应取消剩余 timer
+    fake_lock = MagicMock()
+    fake_lock.__aenter__ = AsyncMock(return_value=True)
+    fake_lock.__aexit__ = AsyncMock(return_value=False)
+    fake_dq = MagicMock()
+    fake_dq.remove_task = AsyncMock(return_value=True)
+
     handler = ClueHandler(MagicMock(), MagicMock())
     notice = MagicMock(spec=WechatNoticeRequest)
     notice.clueId = "clue_wake_1"
-    await handler.on_channel_notify(notice)
+    notice.success = False
+    notice.failed = False
+    with patch("app.clue_handler.clue.redis_manager.get_lock", return_value=fake_lock), \
+         patch("app.clue_handler.clue.redis_manager.get_delayed_queue", return_value=fake_dq):
+        await handler.on_channel_notify(notice)
 
     new_t = await ExecutionTask.get(id=res2["task_id"])
     assert new_t.status == "cancelled"

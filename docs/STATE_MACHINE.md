@@ -10,6 +10,7 @@ Source of truth: `project/app/clue_handler/state.py` (`ClueState` & `VALID_TRANS
 - `calling`: Active outbound call in progress.
 - `summary`: Post-call Agent evaluation and scheduling decision in progress.
 - `pending`: Target reached, waiting on external channel action confirmation (e.g. WeChat / SMS).
+- `awaiting_approval`: Deferred Tool Call suspended awaiting human approval (`POST /api/approvals/{task_id}/resolve`).
 - `accepted`: Terminal success state.
 - `rejected`: Terminal closure/circuit-breaker/cancellation state.
 - `completed`, `cancelled`, `failed`: Legacy-compatible terminal states.

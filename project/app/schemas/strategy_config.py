@@ -54,6 +54,8 @@ class FollowupConfig(BaseModel):
     max_calls: int = Field(default=10, gt=0, description="单个任务呼叫总次数上限，包含首次呼叫")
     max_call_per_day: int = Field(default=3, gt=0, description="单个任务每天的呼叫次数上限")
     max_no_answer_calls: int = Field(default=3, gt=0, description="单个任务累计无人接听次数上限")
+    work_start_time: str = Field(default="09:00:00", description="外呼合规开始时间 HH:MM:SS")
+    work_end_time: str = Field(default="21:00:00", description="外呼合规结束时间 HH:MM:SS")
     model_config = ConfigDict(extra="allow")
 
     @field_validator("summary_type", "summary_prompt", mode="before")

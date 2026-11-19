@@ -7,7 +7,7 @@ import os
 import socket
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from tortoise.exceptions import IntegrityError
 from tortoise.expressions import Q
@@ -35,7 +35,7 @@ def notify_inbox_worker() -> None:
 
 async def enqueue_call_end_inbox(request: CallEndRequest) -> Dict[str, Any]:
     """
-    Event Inbox 秒级落盘入口 (/clue/call-end/notify 专用):
+    Unified Event Inbox 秒级落盘入口 (/clue/call-end/notify 专用):
     仅执行幂等键计算与 ExecutionTask 持久化落库，不跑 LLM、不抢长锁，毫秒级返回 ACK。
     """
     from app.dbmodels.models import ExecutionTask
@@ -66,14 +66,6 @@ async def enqueue_call_end_inbox(request: CallEndRequest) -> Dict[str, Any]:
             run_at=now,
             max_retries=5,
         )
-        # 顺带记录到 Redis 事件合并缓冲并触发后台瞬间唤醒
-        try:
-            from app.clue_handler.clue import ClueHandler
-            await ClueHandler.enqueue_inbox_event_static(
-                clue_id, {"type": "call_end", "task_id": task.id, "call_id": call_id}
-            )
-        except Exception:
-            pass
         notify_inbox_worker()
         logger.info(
             f"[InboxWorker] 【秒回入箱】call_end 已入 Event Inbox: clue_id={clue_id}, task_id={task.id}"
@@ -91,17 +83,54 @@ async def enqueue_call_end_inbox(request: CallEndRequest) -> Dict[str, Any]:
         }
 
 
+async def enqueue_channel_inbox(clue_id: str, notice_payload: Dict[str, Any], request_id: Optional[str] = None) -> Dict[str, Any]:
+    """Unified Event Inbox 渠道事件入口 (/clue/channel/notify 专用)"""
+    from app.dbmodels.models import ExecutionTask
+
+    raw_key = (
+        f"channel_inbox:req:{clue_id}:{request_id}"
+        if request_id
+        else f"channel_inbox:{clue_id}:{uuid.uuid4().hex}"
+    )
+    task_key = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    try:
+        task = await ExecutionTask.create(
+            task_key=task_key,
+            task_type="channel_inbox",
+            request_id=request_id,
+            clue_id=clue_id,
+            payload=notice_payload,
+            status="pending",
+            run_at=_utc_now(),
+            max_retries=5,
+        )
+        notify_inbox_worker()
+        return {"accepted": True, "duplicate": False, "task_id": task.id}
+    except IntegrityError:
+        existing = await ExecutionTask.filter(task_key=task_key).first()
+        return {"accepted": True, "duplicate": True, "task_id": existing.id if existing else None}
+
+
 class InboxWakeupWorker:
     """
     Always-On 后台事件收件箱与认知唤醒定时器消费引擎:
-    统一消费:
-    1. call_end_inbox (异步挂机总结、多专家评估、策略排期与跨业务 Handoff)
-    2. agent_wakeup   (Agent 自设定的认知唤醒闹钟)
+    统一消费并按 clue_id 合并窗口期并发事件:
+    1. call_end_inbox   (异步挂机总结、自适应分层评估、工具调用与跨业务 Handoff)
+    2. agent_wakeup     (Agent 自设定的认知唤醒闹钟)
+    3. channel_inbox    (企微/短信渠道到达回执)
+    4. approval_resumed (Deferred Tool Call 人工审批结果唤醒)
+    5. memory_dream     (后台 LLM 语义级四桶记忆整理)
     """
 
     def __init__(
         self,
-        task_types: Tuple[str, ...] = ("call_end_inbox", "agent_wakeup"),
+        task_types: Tuple[str, ...] = (
+            "call_end_inbox",
+            "agent_wakeup",
+            "channel_inbox",
+            "approval_resumed",
+            "memory_dream",
+        ),
         lease_seconds: int = 60,
     ) -> None:
         self.task_types = task_types
@@ -147,6 +176,42 @@ class InboxWakeupWorker:
                 return None
 
             return await ExecutionTask.filter(id=task.id).using_db(conn).first()
+
+    async def coalesce_pending_inbox_events(
+        self,
+        clue_id: str,
+        current_task_id: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Per-Clue Event Coalescing:
+        批量拉取同线索已到达的 channel_inbox / approval_resumed 待处理事件并合并标记完成，
+        让同一次唤醒 Run 能完整感知所有最新事实，消除竞态拆分。
+        """
+        from app.dbmodels.models import ExecutionTask
+
+        events: List[Dict[str, Any]] = []
+        now = _utc_now()
+        async with in_transaction() as conn:
+            extra_tasks = (
+                await ExecutionTask.filter(
+                    clue_id=clue_id,
+                    task_type__in=["channel_inbox", "approval_resumed"],
+                    status__in=["pending", "retry"],
+                    run_at__lte=now,
+                )
+                .exclude(id=current_task_id)
+                .using_db(conn)
+                .order_by("create_time", "id")
+            )
+            for et in extra_tasks:
+                payload = dict(et.payload or {})
+                ev_type = "channel_notify" if et.task_type == "channel_inbox" else et.task_type
+                events.append({"type": ev_type, "task_id": et.id, **payload})
+                et.status = "succeeded"
+                et.finished_at = now
+                et.result = {"coalesced_into": current_task_id}
+                await et.save(using_db=conn)
+        return events
 
     async def _finish_task(
         self,
@@ -197,19 +262,67 @@ class InboxWakeupWorker:
 
             if task.task_type == "call_end_inbox":
                 req = CallEndRequest.model_validate(task.payload)
-                ok = await handler.on_call_end(req)
+                extra_events = await self.coalesce_pending_inbox_events(clue_id, task.id)
+                if extra_events:
+                    ok = await handler.on_call_end(req, coalesced_events=extra_events)
+                else:
+                    ok = await handler.on_call_end(req)
                 await self._finish_task(
                     task.id, token, succeeded=bool(ok),
-                    result_data={"handler_result": bool(ok)},
+                    result_data={"handler_result": bool(ok), "coalesced_events": len(extra_events)},
                 )
                 return True
 
             if task.task_type == "agent_wakeup":
                 check_goal = (task.payload or {}).get("checkGoal", "")
-                ok = await handler.on_wakeup_timer(clue_id, check_goal=check_goal)
+                extra_events = await self.coalesce_pending_inbox_events(clue_id, task.id)
+                if extra_events:
+                    ok = await handler.on_wakeup_timer(
+                        clue_id,
+                        check_goal=check_goal,
+                        coalesced_events=extra_events,
+                    )
+                else:
+                    ok = await handler.on_wakeup_timer(clue_id, check_goal=check_goal)
                 await self._finish_task(
                     task.id, token, succeeded=bool(ok),
-                    result_data={"wakeup_handled": bool(ok)},
+                    result_data={"wakeup_handled": bool(ok), "coalesced_events": len(extra_events)},
+                )
+                return True
+
+            if task.task_type == "channel_inbox":
+                from app.schemas.channel import WechatNoticeRequest
+                notice = WechatNoticeRequest.model_validate(task.payload)
+                await handler.on_channel_notify(notice)
+                await self._finish_task(
+                    task.id, token, succeeded=True,
+                    result_data={"channel_handled": True},
+                )
+                return True
+
+            if task.task_type == "approval_resumed":
+                payload = dict(task.payload or {})
+                extra_events = await self.coalesce_pending_inbox_events(clue_id, task.id)
+                all_events = [{"type": "approval_resumed", "task_id": task.id, **payload}, *extra_events]
+                ok = await handler.on_wakeup_timer(
+                    clue_id,
+                    check_goal=f"审批恢复执行: {payload.get('tool_name', '')}",
+                    coalesced_events=all_events,
+                )
+                await self._finish_task(
+                    task.id, token, succeeded=bool(ok),
+                    result_data={"approval_resumed": bool(ok)},
+                )
+                return True
+
+            if task.task_type == "memory_dream":
+                from app.agents.memory_dreamer import MemoryDreamer
+                from app.clue_handler.clue import process_lock
+                async with process_lock(clue_id, "memory_dream"):
+                    await MemoryDreamer.dream_semantic_curation(clue_id)
+                await self._finish_task(
+                    task.id, token, succeeded=True,
+                    result_data={"dreamed": True},
                 )
                 return True
 
@@ -240,7 +353,7 @@ class InboxWakeupWorker:
 async def inbox_wakeup_loop() -> None:
     """后台常驻消费循环：平时休眠零开销，收到信号或到期立即唤醒执行"""
     worker = InboxWakeupWorker()
-    logger.info("[InboxWorker] 【启动】Event Inbox & Always-On Wakeup Worker 已启动")
+    logger.info("[InboxWorker] 【启动】Unified Event Inbox & Always-On Wakeup Worker 已启动")
     while True:
         try:
             processed_any = False

@@ -285,8 +285,11 @@ class CallScheduleService:
                                               locked_until__gt=self.clock()).using_db(connection).exists():
                 return False
             zone = ZoneInfo((clue.clue_config or {}).get("timezone", "Asia/Shanghai"))
+            from app.strategy.agent_driven.tools import is_within_working_window, resolve_working_window
+            work_start, work_end = resolve_working_window(clue.clue_config)
+            local_now = self.clock().astimezone(zone)
             if (clue.status != "wait_for_calling" or clue.last_call_id != task.call_id
-                    or not 9 <= self.clock().astimezone(zone).hour < 21
+                    or not is_within_working_window(local_now, work_start, work_end)
                     or (clue.expires_at and utc(clue.expires_at) <= self.clock())):
                 return False
             return not await self.paused(clue, task.payload["roundNo"], connection)
@@ -450,17 +453,26 @@ class CallScheduleService:
 
     async def _get_required_deferral(self, record, connection, now):
         """只读检查：超出工作窗口/当日次数限制时返回延期时间，否则返回 None。"""
-        _, followup, zone = frozen_policy(record)  # 已通过配置和总次数检查。
+        from app.strategy.agent_driven.tools import (
+            is_within_working_window,
+            next_working_window_opening,
+            parse_time_str,
+            resolve_working_window,
+        )
+        config_dict, followup, zone = frozen_policy(record)  # 已通过配置和总次数检查。
+        work_start, work_end = resolve_working_window(config_dict)
         local = now.astimezone(zone)
-        opening = datetime.combine(local.date(), time(9), zone)
-        next_opening = opening if local.hour < 9 else opening+timedelta(days=1)
+        next_opening = next_working_window_opening(local, work_start, work_end)
+        if next_opening <= local:
+            start_t = parse_time_str(work_start)
+            next_opening = datetime.combine(local.date() + timedelta(days=1), start_t, zone)
         day_start = datetime.combine(local.date(), time.min, zone)
         today_calls = await CallRecord.filter(
             clue_id=record.clue_id,
             submitted_at__gte=day_start.astimezone(timezone.utc),
             submitted_at__lt=(day_start+timedelta(days=1)).astimezone(timezone.utc),
         ).exclude(call_id=record.call_id).using_db(connection).count()
-        if not 9 <= local.hour < 21 or today_calls >= followup.get("maxCallPerDay", 3):
+        if not is_within_working_window(local, work_start, work_end) or today_calls >= followup.get("maxCallPerDay", 3):
             return next_opening.astimezone(timezone.utc)
         # Global Outbox Pacer: 跨业务线同客户手机号 24h 总触达防骚扰检查
         max_touches_24h = followup.get("maxTouchesPer24h")

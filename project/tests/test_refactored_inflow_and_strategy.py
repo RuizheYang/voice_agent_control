@@ -200,20 +200,31 @@ class TestVoiceAgentRefactoredPlatform(unittest.IsolatedAsyncioTestCase):
              patch("app.routers.clue_inflow.get_strategy_config", return_value=MagicMock()), \
              patch("app.routers.clue_inflow.verify_inflow_signature", return_value="app_test"), \
              patch("app.routers.clue_inflow.check_and_lock_request_id", return_value=True), \
-             patch("app.routers.clue_inflow.ClueHandlerFactory.get_handler_by_workflow", new_callable=AsyncMock) as mock_get_handler:
+             patch("app.routers.clue_inflow.get_inflow_service") as mock_get_service:
 
-            mock_handler = MagicMock()
-            mock_handler.on_clue_pushed = AsyncMock()
-            mock_get_handler.return_value = mock_handler
+            mock_service = MagicMock()
+            mock_service.accept_clue_create = AsyncMock(return_value={
+                "code": 0,
+                "msg": "success",
+                "data": {
+                    "inflow_type": "single",
+                    "workflow_instance_id": "wi_bound_1",
+                    "import_task_id": "101",
+                    "status": "accepted",
+                },
+            })
+            mock_get_service.return_value = mock_service
 
             resp = await create_single_clue(req)
             self.assertEqual(resp["code"], 0)
             self.assertEqual(resp["data"]["status"], "accepted")
 
-            # 校验推入 handler 的 NormalizedClue 中直接绑定了 Workflow 的 agentId 与 strategyId
-            pushed_clue: NormalizedClue = mock_handler.on_clue_pushed.call_args[0][0]
-            self.assertEqual(pushed_clue.agentId, "agent_car_loan_v1")
-            self.assertEqual(pushed_clue.strategyId, "strategy_car_loan_v1")
+            # 校验请求已收敛至 InflowService.accept_clue_create 事务化受理链路
+            mock_service.accept_clue_create.assert_awaited_once()
+            call_kwargs = mock_service.accept_clue_create.call_args.kwargs
+            self.assertEqual(call_kwargs["app_id"], "app_test")
+            self.assertEqual(call_kwargs["clue_req"].clue_id, "clue_bound")
+            self.assertEqual(call_kwargs["clue_req"].workflow_id, "car_loan")
 
     async def test_clue_inflow_workflow_missing_paired_agent_returns_code_40004(self):
         """测试单条线索流入时虽有 workflow_config 但底表未配套 agent，拦截并返回 code: 40004"""

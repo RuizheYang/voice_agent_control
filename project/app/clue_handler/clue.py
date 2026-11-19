@@ -153,69 +153,132 @@ class ClueHandler:
             return result
 
     async def on_channel_notify(self, notice: WechatNoticeRequest):
-        """渠道事件通知：取消过期的认知唤醒定时器并缓冲合并事件"""
-        clue_id = getattr(notice, "clueId", None) or getattr(notice, "clue_id", None)
-        if clue_id:
+        """渠道事件通知：取消过期的认知唤醒定时器并推进线索终态或触发重试唤醒"""
+        data_obj = getattr(notice, "data", None)
+        clue_id = (
+            getattr(notice, "clueId", None)
+            or getattr(notice, "clue_id", None)
+            or (getattr(data_obj, "custId", None) if data_obj else None)
+        )
+        if not clue_id:
+            logger.warning("[Clue-Handler] 收到缺少 clueId/custId 的渠道通知，已忽略")
+            return {"handled": False, "reason": "missing_clue_id"}
+
+        async with process_lock(clue_id, "on_channel_notify"):
+            from app.dbmodels.models import ExecutionTask
+            from app.agents.memory_dreamer import MemoryDreamer
+            from app.observability.events_bus import ClueEndEvent
+
             try:
-                from app.dbmodels.models import ExecutionTask
+                cancel_types = ["agent_wakeup", "call"] if getattr(notice, "success", None) is True else ["agent_wakeup"]
                 await ExecutionTask.filter(
                     clue_id=clue_id,
-                    task_type="agent_wakeup",
+                    task_type__in=cancel_types,
                     status__in=["pending", "retry"],
                 ).update(status="cancelled", last_error="cancelled_by_channel_event")
-                await self.enqueue_inbox_event(clue_id, {"type": "channel_notify", "payload": str(notice)})
             except Exception as err:
-                logger.debug(f"[Clue-Handler] 渠道事件清理唤醒定时器忽略: {err}")
-        logger.info(f"[Clue-Handler] 接收到通道通知: clue_id={clue_id}")
+                logger.debug(f"[Clue-Handler] 渠道事件清理唤醒/排期任务忽略: {err}")
 
-    @staticmethod
-    async def enqueue_inbox_event_static(clue_id: str, event_payload: dict) -> None:
-        """Event Inbox 缓冲写入：避免并发事件撞锁丢失"""
-        try:
-            import json
-            client = await redis_manager._get_client()
-            if client is not None:
-                await client.rpush(f"clue_inbox:{clue_id}", json.dumps(event_payload, ensure_ascii=False))
-        except Exception:
-            pass
+            try:
+                await redis_manager.get_delayed_queue().remove_task(f"pending:{clue_id}")
+            except Exception:
+                pass
 
-    async def enqueue_inbox_event(self, clue_id: str, event_payload: dict) -> None:
-        """Event Inbox 缓冲写入实例方法"""
-        await self.enqueue_inbox_event_static(clue_id, event_payload)
+            is_success = getattr(notice, "success", None) is True
+            is_failed = getattr(notice, "failed", None) is True
+            result_code = getattr(data_obj, "resultCode", None) if data_obj else None
+            result_msg = getattr(data_obj, "resultMessage", None) if data_obj else None
 
-    async def drain_inbox_events(self, clue_id: str) -> list:
-        """单 Worker 唤醒时批量取出并合并待处理事件"""
-        events = []
-        try:
-            import json
-            client = await redis_manager._get_client()
-            if client is not None:
-                key = f"clue_inbox:{clue_id}"
-                while True:
-                    raw = await client.lpop(key)
-                    if not raw:
-                        break
-                    events.append(json.loads(raw))
-        except Exception:
-            pass
-        return events
+            cur_state = await crud.get_clue_state(clue_id)
+            if cur_state in (ClueState.ACCEPTED.value, ClueState.REJECTED.value, "completed", "cancelled", "failed"):
+                logger.info(f"[Clue-Handler] 线索 {clue_id} 已终结 ({cur_state})，跳过渠道回调")
+                return {"handled": True, "outcome": "already_terminal", "state": cur_state}
 
-    async def on_wakeup_timer(self, clue_id: str, check_goal: str = "") -> bool:
-        """处理 Always-On 认知型自唤醒定时器到期事件"""
+            if is_success:
+                try:
+                    await crud.update_clue_state_or_raise(clue_id, ClueState.ACCEPTED.value)
+                    await crud.save_close_reason(clue_id, "渠道添加成功(企微/通道回执)")
+                except Exception as st_err:
+                    logger.warning(f"[Clue-Handler] 渠道成功流转 ACCEPTED 异常: {st_err}")
+
+                try:
+                    await MemoryDreamer.curate_and_persist(
+                        clue_id,
+                        digest_entry=f"[渠道回调] 添加成功 (resultCode={result_code})",
+                        progress="accepted_via_channel",
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    clue_rec = await crud.get_clue_info(clue_id)
+                    await event_bus.emit(ClueEndEvent(
+                        clue_id=clue_id,
+                        workflow_id=clue_rec.workflow_id if clue_rec else self.workflow_id,
+                        event_data={"code": 200, "reason": "渠道添加成功", "resultCode": result_code},
+                    ))
+                except Exception as ev_err:
+                    logger.warning(f"[Clue-Handler] 渠道成功发射 ClueEndEvent 异常: {ev_err}")
+
+                logger.info(f"[Clue-Handler] 【渠道收口】线索 {clue_id} 添加成功 -> ACCEPTED")
+                return {"handled": True, "outcome": "accepted"}
+
+            if is_failed:
+                # 渠道添加失败时记录记忆并推入统一 Inbox 唤醒 Agent 决策是否补发短信或转电话
+                try:
+                    await MemoryDreamer.curate_and_persist(
+                        clue_id,
+                        digest_entry=f"[渠道回调] 添加失败 (code={result_code}, msg={result_msg or ''})",
+                        progress="channel_failed_pending_decision",
+                    )
+                except Exception:
+                    pass
+                try:
+                    import hashlib
+                    import uuid
+                    from datetime import datetime, timezone
+                    from app.agents.inbox_worker import notify_inbox_worker
+
+                    await ExecutionTask.create(
+                        task_key=hashlib.sha256(f"wakeup:chfail:{clue_id}:{uuid.uuid4().hex}".encode()).hexdigest(),
+                        task_type="agent_wakeup",
+                        workflow_id=self.workflow_id,
+                        clue_id=clue_id,
+                        payload={
+                            "checkGoal": f"渠道添加失败(code={result_code}): 评估改发短信或安排电话补呼",
+                            "channel_result_code": result_code,
+                        },
+                        status="pending",
+                        run_at=datetime.now(timezone.utc),
+                    )
+                    notify_inbox_worker()
+                except Exception as w_err:
+                    logger.debug(f"[Clue-Handler] 渠道失败创建唤醒任务忽略: {w_err}")
+
+            logger.info(f"[Clue-Handler] 接收到通道通知: clue_id={clue_id}, code={result_code}")
+            return {"handled": True, "outcome": "notified", "resultCode": result_code}
+
+    async def on_wakeup_timer(
+        self,
+        clue_id: str,
+        check_goal: str = "",
+        coalesced_events: Optional[list] = None,
+    ) -> bool:
+        """处理 Always-On 认知型自唤醒定时器到期事件：合并窗口事件并唤醒 SupervisorAgent"""
         async with process_lock(clue_id, "on_wakeup_timer"):
-            inbox_events = await self.drain_inbox_events(clue_id)
+            merged_events = list(coalesced_events or [])
             logger.info(
                 f"[Clue-Handler] 【认知唤醒】clue_id={clue_id}, goal={check_goal!r}, "
-                f"coalesced_inbox_events={len(inbox_events)}"
+                f"coalesced_inbox_events={len(merged_events)}"
             )
             state = await crud.get_clue_state(clue_id)
             if state in (ClueState.ACCEPTED.value, ClueState.REJECTED.value, "completed", "cancelled", "failed"):
                 return True
-            from app.agents.memory_dreamer import MemoryDreamer
-            await MemoryDreamer.curate_and_persist(
+            from app.agents.supervisor import clue_supervisor_agent
+            await clue_supervisor_agent.evaluate_wakeup(
                 clue_id,
-                digest_entry=f"[唤醒自检] {check_goal} (合并事件 {len(inbox_events)} 条)",
-                progress="wakeup_checked",
+                check_goal=check_goal,
+                coalesced_events=merged_events,
             )
             return True
 
@@ -242,6 +305,21 @@ class ClueHandler:
         async with process_lock(clue.clueId, "on_clue_queue"):
             logger.info(f"[Clue-Handler] 【开始】准备处理队列中提取的线索: {clue.clueId}")
             result = await self.new_clue_handler.handle(clue)
+            if result:
+                try:
+                    from datetime import datetime, timezone
+                    from app.dbmodels.models import ExecutionTask
+                    await ExecutionTask.filter(
+                        clue_id=clue.clueId,
+                        task_type="new_clue",
+                        status__in=["pending", "retry"],
+                    ).update(
+                        status="succeeded",
+                        result={"entryStatus": "entered"},
+                        finished_at=datetime.now(timezone.utc),
+                    )
+                except Exception:
+                    pass
             logger.info(f"[Clue-Handler] 【完成】队列提取线索业务逻辑处理完毕: {clue.clueId}")
             return result
 
@@ -254,11 +332,18 @@ class ClueHandler:
             logger.info(f"[Clue-Handler] 【完成】定时排期到期任务处理完毕: clue_id={clue_id}")
             return result
 
-    async def on_call_end(self, end_call_info: CallEndRequest) -> bool:
+    async def on_call_end(
+        self,
+        end_call_info: CallEndRequest,
+        coalesced_events: Optional[list] = None,
+    ) -> bool:
         """外呼挂机结束回调入口：直接交由 PostCallHandler 完成落库、总结分析与排期次呼"""
         clue_id = end_call_info.data.clueId if hasattr(end_call_info, "data") and end_call_info.data else str(end_call_info)
         async with process_lock(clue_id, "on_call_end"):
             logger.info(f"[Clue-Handler] 【开始】处理外呼结束挂机回调: clue_id={clue_id}")
-            result = await self.postcall_handler.handle(end_call_info)
+            if coalesced_events:
+                result = await self.postcall_handler.handle(end_call_info, coalesced_events=coalesced_events)
+            else:
+                result = await self.postcall_handler.handle(end_call_info)
             logger.info(f"[Clue-Handler] 【完成】外呼结束业务逻辑处理完毕: clue_id={clue_id}")
             return result

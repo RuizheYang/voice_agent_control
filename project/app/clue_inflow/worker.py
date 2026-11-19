@@ -59,10 +59,21 @@ def as_utc(value):
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
+def _safe_decrypt(value: str | None) -> str | None:
+    if not value:
+        return value
+    if len(value) > 20:
+        try:
+            return crypted_manager.decrypt_field(value)
+        except Exception:
+            return value
+    return value
+
+
 def to_normalized(clue, request_id):
     return NormalizedClue(
-        clueId=clue.clue_id, phoneNumber=crypted_manager.decrypt_field(clue.phone_number),
-        customerName=crypted_manager.decrypt_field(clue.customer_name) if clue.customer_name else None,
+        clueId=clue.clue_id, phoneNumber=_safe_decrypt(clue.phone_number) or "",
+        customerName=_safe_decrypt(clue.customer_name) if clue.customer_name else None,
         workflowId=clue.workflow_id, agentId=clue.agent_id, strategyId=clue.strategy_id,
         externalTaskId=clue.external_task_id, requestId=request_id,
         accessReceiveTime=as_utc(clue.received_at).astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S"),

@@ -17,6 +17,49 @@ def parse_time_str(time_str: str) -> time:
     return time(parts[0], parts[1], parts[2])
 
 
+def resolve_working_window(
+    config_source: Optional[Dict[str, Any]] = None,
+    default_start: str = "09:00:00",
+    default_end: str = "21:00:00",
+) -> tuple[str, str]:
+    """从 clue_config / followup / domain_pack 中统一提取合规工时窗口，消除硬编码 9-21"""
+    if not isinstance(config_source, dict):
+        return default_start, default_end
+    followup = config_source.get("followup") if isinstance(config_source.get("followup"), dict) else config_source
+    start_val = followup.get("work_start_time") or followup.get("workStartTime") or default_start
+    end_val = followup.get("work_end_time") or followup.get("workEndTime") or default_end
+    try:
+        parse_time_str(str(start_val))
+        parse_time_str(str(end_val))
+        return str(start_val), str(end_val)
+    except Exception:
+        return default_start, default_end
+
+
+def next_working_window_opening(
+    local_dt: datetime,
+    work_start: str = "09:00:00",
+    work_end: str = "21:00:00",
+) -> datetime:
+    """计算给定本地时间在合规工时窗口外的下一个开工时刻"""
+    start_t = parse_time_str(work_start)
+    end_t = parse_time_str(work_end)
+    if local_dt.time() < start_t:
+        return datetime.combine(local_dt.date(), start_t, local_dt.tzinfo)
+    if local_dt.time() >= end_t:
+        return datetime.combine(local_dt.date() + timedelta(days=1), start_t, local_dt.tzinfo)
+    return local_dt
+
+
+def working_window_end_for_date(
+    local_dt: datetime,
+    work_end: str = "21:00:00",
+) -> datetime:
+    """计算给定日期的合法工时截止时刻"""
+    end_t = parse_time_str(work_end)
+    return datetime.combine(local_dt.date(), end_t, local_dt.tzinfo)
+
+
 def is_within_working_window(
     dt: datetime,
     work_start: str = "09:00:00",

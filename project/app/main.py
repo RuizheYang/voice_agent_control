@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 from app.utils.wechatbot import setup_global_wechat_logger
-from app.utils.workers import clue_scheduler_loop, clue_consumer_loop
+from app.utils.workers import clue_scheduler_loop
 from app.clue_inflow.worker import file_import_loop, new_clue_entry_loop
 from app.call_schedule.worker import call_dispatch_loop, call_reconcile_loop
 from app.agents.inbox_worker import inbox_wakeup_loop
@@ -18,6 +18,7 @@ from app.redis_client.redis_manager import redis_manager
 from app.routers import clue_webhook
 from app.routers import clue_inflow
 from app.routers import config_admin
+from app.routers import in_call_control
 from app.routers import observability as observability_router
 from app.routers import analytics as analytics_router
 from app.observability.events_bus import event_bus
@@ -73,11 +74,6 @@ async def lifespan(app: FastAPI):
     workers.append(asyncio.create_task(call_reconcile_loop(), name="call-schedule-reconcile"))
     for index in range(call_schedule_settings.workers):
         workers.append(asyncio.create_task(call_dispatch_loop(), name=f"call-dispatch-{index}"))
-    
-    for i in range(2):
-        task = asyncio.create_task(clue_consumer_loop())
-        workers.append(task)
-        logger.info(f"启动 第 {i+1} 个消费线索 worker")
 
     logger.info("启动线索状态定时轮询调度器...")
     scheduler_task = asyncio.create_task(clue_scheduler_loop())
@@ -114,6 +110,7 @@ app.add_middleware(
 app.include_router(clue_inflow.router)
 app.include_router(config_admin.router)
 app.include_router(clue_webhook.router)
+app.include_router(in_call_control.router)
 app.include_router(observability_router.router)
 app.include_router(analytics_router.router)
 

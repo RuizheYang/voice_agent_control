@@ -9,6 +9,7 @@ from app.schemas import (
     CallEndRequest,
     StartCallRequest,
     CancelClueRequest,
+    WechatNoticeRequest,
 )
 from app.clue_handler.factory import ClueHandlerFactory
 from app.utils.exceptions import StateTransitionError, LockTimeoutError
@@ -84,6 +85,33 @@ async def call_start_notify(request: StartCallRequest):
         batch_id=request.batchId,
     )
     return WebhookResponse(code=0, msg="Call start notice received successfully")
+
+
+@router.post("/channel/notify", response_model=WebhookResponse, summary="外部触达渠道状态回调 (企微/短信)")
+@handle_webhook_exceptions
+async def channel_notify(request: WechatNoticeRequest, sync: bool = False):
+    """
+    外部触达渠道状态回调（如企业微信添加结果 resultCode='3' 成功 / '1','4','434' 失败）：
+    - 默认 sync=False: Fast-ACK 持久化写入 Unified Event Inbox (`channel_inbox`) 并唤醒 InboxWakeupWorker（支持与 call_end_inbox 事件合并）；
+    - sync=True: 即时同步推进状态机 (PENDING -> ACCEPTED) 并清理过期的 agent_wakeup 与 call 排期任务。
+    """
+    data_obj = getattr(request, "data", None)
+    clue_id = (
+        getattr(request, "clueId", None)
+        or getattr(request, "clue_id", None)
+        or (getattr(data_obj, "custId", None) if data_obj else None)
+    )
+    if not clue_id:
+        return WebhookResponse(code=1, msg="缺少 clueId 或 data.custId")
+
+    if not sync:
+        from app.agents.inbox_worker import enqueue_channel_inbox
+        await enqueue_channel_inbox(clue_id, request.model_dump(mode="json"))
+        return WebhookResponse(code=0, msg="Channel notice queued for async processing")
+
+    handler = await ClueHandlerFactory.get_handler_by_clue(clue_id)
+    await handler.on_channel_notify(request)
+    return WebhookResponse(code=0, msg="Channel notice processed successfully")
 
 
 @router.post("/cancel", response_model=WebhookResponse, summary="取消单条线索跟进")

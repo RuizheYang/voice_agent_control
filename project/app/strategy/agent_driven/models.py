@@ -120,6 +120,8 @@ class MasterSummaryDecision(BaseModel):
     handoff_workflow_id: Optional[str] = Field(None, description="建议切换的下游目标业务线 workflow_id")
     handoff_context_summary: Optional[str] = Field(None, description="跨业务交接给新业务的客户背景摘要")
     custom_evaluator_findings: Dict[str, Any] = Field(default_factory=dict, description="业务卡带专属评估器的提取结论")
+    tool_executions: List[Dict[str, Any]] = Field(default_factory=list, description="本次推理调用的工具审计记录")
+    deferred_approval: Optional[Dict[str, Any]] = Field(None, description="若触发高危工具人工审批挂起，保存挂起详情")
 
     @field_validator("next_call_time")
     def validate_next_call_time_for_terminals(cls, v: Optional[datetime], values) -> Optional[datetime]:
@@ -146,6 +148,9 @@ class AgentStrategyConfig(BaseStrategyConfig):
     call_max_time: int = 72                # 最大跟进周期 (小时)
     timeout_seconds: float = 5.0           # Agent 单次推理超时 (秒)，超时即降级
     shadow_mode: bool = False              # 是否开启影子比对模式
+    evaluation_mode: Literal["single_pass", "map_reduce"] = "single_pass"
+    workflow_id: str = "default"
+    max_touches_per_24h: int = 5
     strategy_prompt: Optional[str] = None  # 定制化策略人设与目标 Prompt
     domain_master_prompt: Optional[str] = None
     allowed_handoff_targets: List[str] = field(default_factory=list)

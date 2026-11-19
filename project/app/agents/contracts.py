@@ -101,7 +101,11 @@ class BusinessDomainPack(BaseModel):
     voice_agent_id: str = "default"
     strategy_id: str = "default"
 
-    # 评估器配置
+    # 评估器与决策模式配置
+    evaluation_mode: Literal["single_pass", "map_reduce"] = Field(
+        default="single_pass",
+        description="决策模式: single_pass(默认单次复合推理+工具挂载) / map_reduce(多专家并发+主控汇总)",
+    )
     enabled_sub_evaluators: List[str] = Field(
         default_factory=lambda: ["intent", "objection", "appointment", "sentiment"],
         description="启用的内置子评估器列表",
@@ -110,6 +114,15 @@ class BusinessDomainPack(BaseModel):
         default_factory=list, description="业务卡带自定义的声明式子评估器"
     )
     domain_master_prompt: Optional[str] = Field(None, description="注入主控决策 Prompt 的业务专属准则")
+
+    # 合规工时窗口 (替代硬编码 9-21)
+    work_start_time: str = Field(default="09:00:00", description="外呼合规开始时间 HH:MM:SS")
+    work_end_time: str = Field(default="21:00:00", description="外呼合规结束时间 HH:MM:SS")
+
+    # 通话中实时多智能体流配置 (对齐 Pipecat Flows / LiveKit Agents)
+    in_call_flow: Optional[Dict[str, Any]] = Field(
+        default=None, description="通话中实时多智能体节点配置 (initial_node, nodes, realtime_handoff_rules)"
+    )
 
     # 工具与权限配置
     declarative_http_tools: List[DeclarativeHttpToolSpec] = Field(default_factory=list)
@@ -152,6 +165,7 @@ class SupervisorActionPlan(BaseModel):
     handoff_summary: Optional[str] = None
     summary_decision: Optional[Any] = None
     tool_executions: List[ToolExecutionRecord] = Field(default_factory=list)
+    deferred_approval: Optional[Dict[str, Any]] = None
     reasoning: str = ""
     fallback_used: bool = False
 
@@ -165,4 +179,5 @@ class AgentRuntimeDeps(BaseModel):
     target_descriptions: Dict[str, str] = Field(default_factory=dict)
     phone_number: Optional[str] = None
     recent_24h_touches: int = 0
+    coalesced_events: List[Dict[str, Any]] = Field(default_factory=list)
     dry_run: bool = False

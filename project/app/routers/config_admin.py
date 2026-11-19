@@ -52,6 +52,12 @@ class AppAuthRegisterRequest(BaseModel):
     app_name: Optional[str] = Field(None, description="应用名称")
     allowed_workflows: Optional[List[str]] = Field(default_factory=lambda: ["*"], description="允许的 workflow_id 列表")
 
+
+class ApprovalResolveRequest(BaseModel):
+    approved: bool = Field(..., description="True 放行执行工具，False 驳回")
+    reviewer: str = Field(default="operator", description="审批操作人")
+    comment: str = Field(default="", description="审批意见备注")
+
 # ==================== 1. Voice Agent 配置管理 ====================
 
 @router.post("/voice-agent/create", response_model=VoiceAgentConfigResponse, summary="创建或更新 Voice Agent")
@@ -391,3 +397,33 @@ async def register_app_auth(request: AppAuthRegisterRequest):
             "allowed_workflows": saved.allowed_workflows,
         }
     }
+
+
+# ==================== 6. Deferred Tool Calls 人工审批管理 ====================
+
+@router.get("/api/approvals/pending", summary="查询待人工审批的 Deferred Tool Call 列表")
+async def api_list_pending_approvals(
+    clue_id: Optional[str] = Query(None, description="按线索 ID 过滤"),
+    limit: int = Query(50, ge=1, le=200),
+):
+    from app.agents.approvals import list_pending_approvals
+    items = await list_pending_approvals(clue_id=clue_id, limit=limit)
+    return {"code": 0, "msg": "success", "data": items}
+
+
+@router.post("/api/approvals/{task_id}/resolve", summary="审批并唤醒挂起的 Deferred Tool Call")
+async def api_resolve_deferred_approval(
+    task_id: int = Path(..., description="tool_approval 任务 ID"),
+    request: ApprovalResolveRequest = ...,
+):
+    from app.agents.approvals import resolve_deferred_approval
+    try:
+        res = await resolve_deferred_approval(
+            task_id,
+            approved=request.approved,
+            reviewer=request.reviewer,
+            comment=request.comment,
+        )
+        return {"code": 0, "msg": "success", "data": res}
+    except ValueError as err:
+        raise HTTPException(status_code=404, detail={"code": 40004, "msg": str(err)})

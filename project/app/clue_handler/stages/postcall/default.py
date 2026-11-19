@@ -88,7 +88,12 @@ class DefaultPostCallHandler(BasePostCallHandler):
             call_id=call_id,
         )
 
-    async def handle(self, end_call_info: Union[CallEndRequest, str], request_id: Optional[str] = None) -> bool:
+    async def handle(
+        self,
+        end_call_info: Union[CallEndRequest, str],
+        request_id: Optional[str] = None,
+        coalesced_events: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
         clue_id = ""
         try:
             resolved_record = None
@@ -228,9 +233,43 @@ class DefaultPostCallHandler(BasePostCallHandler):
             # ==================== 下一轮追呼排期推演与终态流转 ====================
             try:
                 from app.strategy.contracts import ClueContext
-                from app.dbmodels.models import ClueInfo, OutboundStrategy
+                from app.dbmodels.models import ClueInfo, OutboundStrategy, ExecutionTask
                 from app.observability.events_bus import event_bus, ClueEndEvent
                 from app.utils.time_utils import get_now
+
+                # Per-Clue Event Coalescing: 若合并窗口内已有渠道成功事件（如企微通过），直接收口 ACCEPTED 并跳过排期
+                for ev in (coalesced_events or []):
+                    ev_data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+                    is_ch_success = (
+                        ev.get("type") == "channel_notify"
+                        and (ev.get("success") is True or str(ev_data.get("resultCode", "")) == "3")
+                    )
+                    if is_ch_success:
+                        await ExecutionTask.filter(
+                            clue_id=clue_id,
+                            task_type__in=["agent_wakeup", "call"],
+                            status__in=["pending", "retry"],
+                        ).update(status="cancelled", last_error="cancelled_by_coalesced_channel_success")
+
+                        clue_obj = await ClueInfo.filter(clue_id=clue_id).first()
+                        if clue_obj:
+                            from app.agents.memory_dreamer import MemoryDreamer
+                            clue_obj.agent_data = MemoryDreamer.apply_to_agent_data(
+                                clue_obj.agent_data,
+                                digest_entry="[事件合并] 通话后窗口内收到渠道添加成功通知，直接收口 ACCEPTED",
+                                progress="accepted_via_coalesced_channel",
+                            )
+                            await clue_obj.save(update_fields=["agent_data", "update_time"])
+
+                        await crud.update_clue_state_or_raise(clue_id, ClueState.ACCEPTED.value)
+                        await crud.save_close_reason(clue_id, "渠道添加成功(事件合并收口)")
+                        await event_bus.emit(ClueEndEvent(
+                            clue_id=clue_id,
+                            workflow_id=clue_obj.workflow_id if clue_obj else None,
+                            event_data={"code": 200, "reason": "渠道添加成功(事件合并收口)"},
+                        ))
+                        logger.info(f"[PostCallHandler] 【事件合并收口】线索 {clue_id} 合并渠道成功事件 -> ACCEPTED")
+                        return True
 
                 clue = await ClueInfo.filter(clue_id=clue_id).first()
                 strategy_id = clue.strategy_id if clue and clue.strategy_id else "default"
@@ -313,38 +352,46 @@ class DefaultPostCallHandler(BasePostCallHandler):
                     else:
                         effective_directive = handoff_prefix or effective_directive
 
-                # 异步触发 Always-On 记忆整理 (Dreaming Pass，绝不阻塞关键路径)
-                try:
-                    from app.agents.memory_dreamer import MemoryDreamer
-                    custom_facts = getattr(master_dec, "custom_evaluator_findings", None) if master_dec else None
-                    MemoryDreamer.schedule_background_dream(
-                        clue_id,
-                        directive=effective_directive,
-                        customer_facts=custom_facts if isinstance(custom_facts, dict) else None,
-                        digest_entry=call_summary or schedule_result.reason,
-                        progress=getattr(schedule_result, "business_status", None) or "followup",
-                    )
-                except Exception:
-                    pass
-
-                if (effective_directive or master_dec) and clue:
+                # 在持锁主协程内同步原子合并 4 桶记忆，消除并发写覆盖竞态
+                custom_facts = getattr(master_dec, "custom_evaluator_findings", None) if master_dec else None
+                if clue:
                     try:
-                        if effective_directive:
-                            agent_data = dict(clue.agent_data or {})
-                            agent_data["agent_directive"] = effective_directive
-                            clue.agent_data = agent_data
-                            await clue.save()
-                        if latest_call:
-                            dec = dict(latest_call.decision_result or {})
-                            if effective_directive:
-                                dec["voice_agent_directive"] = effective_directive
-                            if master_dec and hasattr(master_dec, "model_dump"):
-                                dec["master_decision"] = master_dec.model_dump(mode="json")
-                                latest_call.summary_status = "succeeded"
-                            latest_call.decision_result = dec
-                            await latest_call.save()
+                        from app.agents.memory_dreamer import MemoryDreamer
+                        clue.agent_data = MemoryDreamer.apply_to_agent_data(
+                            clue.agent_data,
+                            directive=effective_directive,
+                            customer_facts=custom_facts if isinstance(custom_facts, dict) else None,
+                            digest_entry=call_summary or schedule_result.reason,
+                            progress=getattr(schedule_result, "business_status", None) or "followup",
+                        )
+                        await clue.save(update_fields=["agent_data", "update_time"])
+                        mem_obj = MemoryDreamer.load_memory(clue.agent_data)
+                        if len(mem_obj.interaction_digest) >= 3 or handoff_succeeded:
+                            MemoryDreamer.schedule_background_dream(clue_id, run_semantic=True)
                     except Exception as dir_err:
-                        logger.warning(f"[PostCallHandler] 持久化 Agent 决策上下文异常: {dir_err}")
+                        logger.warning(f"[PostCallHandler] 持久化 Agent 决策与四桶记忆异常: {dir_err}")
+
+                if latest_call and (effective_directive or master_dec):
+                    try:
+                        dec = dict(latest_call.decision_result or {})
+                        if effective_directive:
+                            dec["voice_agent_directive"] = effective_directive
+                        if master_dec and hasattr(master_dec, "model_dump"):
+                            dec["master_decision"] = master_dec.model_dump(mode="json")
+                            latest_call.summary_status = "succeeded"
+                        latest_call.decision_result = dec
+                        await latest_call.save()
+                    except Exception as call_dir_err:
+                        logger.warning(f"[PostCallHandler] 持久化 CallRecord 决策异常: {call_dir_err}")
+
+                # 若触发高危工具人工审批挂起 (Deferred Tool Call)，流转为 AWAITING_APPROVAL 并结束本次 Run
+                deferred_approval = getattr(master_dec, "deferred_approval", None) if master_dec else None
+                if deferred_approval:
+                    cur_st = await crud.get_clue_state(clue_id)
+                    if cur_st != ClueState.AWAITING_APPROVAL.value:
+                        await crud.update_clue_state_or_raise(clue_id, ClueState.AWAITING_APPROVAL.value)
+                    logger.info(f"[PostCallHandler] 高危工具等待人工审批，线索挂起为 AWAITING_APPROVAL: clue_id={clue_id}")
+                    return True
 
                 # 消费 Agent 驱动的 4 态终态标准
                 biz_status = getattr(schedule_result, "business_status", None)

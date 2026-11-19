@@ -65,37 +65,25 @@ class DefaultCancelHandler(BaseCancelHandler):
         except Exception as q_err:
             logger.debug(f"[DefaultCancelHandler] 清理延迟任务异常 (可忽略): {q_err}")
 
-        # 4. 触发标准结案事件回推 (Webhook 同步推送 + EventBus 审计)
+        # 4. 触发标准结案事件回推 (统一由 EventBus 持久化并投递一次 Webhook，消除重复推送)
         try:
-            from app.apis.webhook_dispatcher import dispatch_webhook_event
             from app.dbmodels.models import ClueInfo
 
             clue = await ClueInfo.filter(clue_id=clue_id).first()
             workflow_id = clue.workflow_id if clue else None
 
-            # 4.1 同步推送外部 Webhook (clue_end)
-            await dispatch_webhook_event(
-                event="clue_end",
-                clue_id=clue_id,
-                data={
-                    "code": 300,
-                    "reason": reason,
-                    "clue_id": clue_id,
-                    "workflow_id": workflow_id,
-                    "close_reason": reason,
-                }
-            )
-
-            # 4.2 发送 ClueEndEvent 入库 MySQL 审计
             await event_bus.emit(ClueEndEvent(
                 clue_id=clue_id,
                 workflow_id=workflow_id,
                 event_data={
                     "code": 300,
                     "reason": reason,
+                    "clue_id": clue_id,
+                    "workflow_id": workflow_id,
+                    "close_reason": reason,
                 }
             ))
-            logger.info(f"[DefaultCancelHandler] 【事件推送】已成功推送 clue_end 事件: clue_id={clue_id}")
+            logger.info(f"[DefaultCancelHandler] 【事件推送】已发射 clue_end 事件至 EventBus: clue_id={clue_id}")
         except Exception as ev_err:
             logger.warning(f"[DefaultCancelHandler] 推送结案事件异常 (已降级): {ev_err}")
 

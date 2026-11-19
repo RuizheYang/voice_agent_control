@@ -99,8 +99,10 @@ class InflowService:
                 value = followup.setdefault(key, default)
                 if type(value) is not int or not 1 <= value <= 100000:
                     raise ValueError("invalid limit")
-            webhooks = normalize_config(strategy.webhook or [])
-            if isinstance(webhooks, dict):
+            webhooks = normalize_config(strategy.webhook) if strategy.webhook else []
+            if webhooks == {}:
+                webhooks = []
+            elif isinstance(webhooks, dict):
                 webhooks = [webhooks]
             if not isinstance(webhooks, list) or any(
                 not isinstance(item, dict) or not isinstance(item.get("url"), str) or not item["url"].strip()
@@ -159,10 +161,43 @@ class InflowService:
                                app_id, request_id, workflow_id, error.code)
             raise
 
+    @staticmethod
+    def _merge_legacy_fields(row) -> dict:
+        base = copy.deepcopy(row.agent_data) if isinstance(getattr(row, "agent_data", None), dict) else {}
+        variables = dict(base.get("variables") or {}) if isinstance(base.get("variables"), dict) else {}
+        for attr, var_key in (
+            ("customerName", "name"),
+            ("customerSex", "sex"),
+            ("customerCity", "city"),
+            ("orderTime", "orderTime"),
+            ("clueSource", "clueSource"),
+        ):
+            val = getattr(row, attr, None)
+            if val is not None and var_key not in variables:
+                variables[var_key] = val
+        if variables:
+            base["variables"] = variables
+        return base
+
+    @staticmethod
+    def _extract_overrides(row) -> dict:
+        raw = getattr(row, "overrides", None)
+        if hasattr(raw, "model_dump"):
+            overrides = raw.model_dump(exclude_none=True)
+        elif isinstance(raw, dict):
+            overrides = {k: v for k, v in raw.items() if v is not None}
+        else:
+            overrides = {}
+        callback_url = getattr(row, "callBackUrl", None)
+        if callback_url and "callback_url" not in overrides:
+            overrides["callback_url"] = callback_url
+        return overrides
+
     def clue_values(self, row, task, overrides=None):
         snapshot = copy.deepcopy(task.payload["baseConfig"])
         received_at = datetime.fromisoformat(task.payload["receivedAt"])
-        name = row.agent_data.get("variables", {}).get("name")
+        agent_data = self._merge_legacy_fields(row)
+        name = agent_data.get("variables", {}).get("name") or getattr(row, "customerName", None)
         phone = crypted_manager.encrypt_field(row.phone_number, IT_VERSION_LABEL)
         name = crypted_manager.encrypt_field(str(name), IT_VERSION_LABEL) if name is not None else None
         if len(phone) > 512 or (name is not None and len(name) > 512):
@@ -173,25 +208,24 @@ class InflowService:
         return dict(clue_id=row.clue_id, workflow_instance_id=f"wi_{uuid.uuid4().hex}",
                     source_app_id=task.app_id, external_task_id=row.external_task_id,
                     workflow_id=task.workflow_id, agent_id=snapshot["agentId"], strategy_id=snapshot["strategyId"],
-                    import_task_id=task.id, phone_number=phone, customer_name=name, agent_data=row.agent_data,
+                    import_task_id=task.id, phone_number=phone, customer_name=name, agent_data=agent_data,
                     overrides={normalized[key]: value for key, value in overrides.items()} or None,
                     clue_config=snapshot, status="created", received_at=received_at,
                     expires_at=received_at + timedelta(hours=snapshot["followup"]["maxFollowupHours"]))
 
-    async def accept_single(self, app_id, payload, allowed_workflows):
-        overrides = payload.overrides.model_dump(exclude_none=True) if payload.overrides else {}
+    async def _accept_single_core(self, app_id, request_id, workflow_id, raw_payload, row, overrides, allowed_workflows):
         try:
-            snapshot = await self.context(app_id, payload.request_id, payload.workflow_id, "single",
-                                          payload.model_dump(), overrides, allowed_workflows)
+            snapshot = await self.context(app_id, request_id, workflow_id, "single",
+                                          raw_payload, overrides, allowed_workflows)
             async with repository.transaction() as connection:
-                task = await repository.register_request(connection, app_id, payload.request_id, payload.workflow_id,
-                                                           self.payload("single", payload.model_dump(), snapshot))
+                task = await repository.register_request(connection, app_id, request_id, workflow_id,
+                                                           self.payload("single", raw_payload, snapshot))
                 clue, created = await repository.insert_clue(
-                    connection, self.clue_values(payload, task, overrides), request_id=task.request_id,
+                    connection, self.clue_values(row, task, overrides), request_id=task.request_id,
                 )
                 if not created:
                     logger.info("[Clue-Inflow] 【幂等拦截】线索已存在: app_id=%r, request_id=%r, clue_id=%r",
-                                app_id, payload.request_id, payload.clue_id)
+                                app_id, request_id, row.clue_id)
                     raise InflowError(40005, "clue_id 已存在，不会覆盖原线索", 409)
                 data = {"inflow_type": "single", "workflow_instance_id": clue.workflow_instance_id,
                         "import_task_id": str(task.id), "status": "accepted"}
@@ -202,20 +236,35 @@ class InflowService:
                 task.finished_at = repository.utc_now()
                 await task.save(using_db=connection)
             logger.info("[Clue-Inflow] 【完成】单条线索受理已提交: task_id=%s, app_id=%r, request_id=%r, workflow_id=%r, clue_id=%r, status=created",
-                        task.id, app_id, payload.request_id, payload.workflow_id, clue.clue_id)
+                        task.id, app_id, request_id, workflow_id, clue.clue_id)
             await self.dispatch_followup(task)
             return response(data)
         except repository.RequestConflict as error:
             raise await repository.duplicate_request_error(error.key) from error
 
-    async def accept_batch(self, app_id, payload, allowed_workflows):
+    async def accept_single(self, app_id, payload, allowed_workflows):
+        overrides = self._extract_overrides(payload)
+        return await self._accept_single_core(
+            app_id, payload.request_id, payload.workflow_id, payload.model_dump(), payload, overrides, allowed_workflows
+        )
+
+    async def accept_clue_create(self, app_id, clue_req, allowed_workflows=None):
+        """统一 /clue/create 与 /inflow/single 的事务化受理入口。"""
+        request_id = clue_req.request_id or f"req_{clue_req.clue_id}_{uuid.uuid4().hex[:8]}"
+        overrides = self._extract_overrides(clue_req)
+        return await self._accept_single_core(
+            app_id, request_id, clue_req.workflow_id, clue_req.model_dump(), clue_req, overrides,
+            allowed_workflows or ["*"],
+        )
+
+    async def _accept_batch_core(self, app_id, request_id, workflow_id, raw_payload, rows, allowed_workflows):
         try:
-            snapshot = await self.context(app_id, payload.request_id, payload.workflow_id, "batch",
-                                          payload.model_dump(), {}, allowed_workflows)
+            snapshot = await self.context(app_id, request_id, workflow_id, "batch",
+                                          raw_payload, {}, allowed_workflows)
             async with repository.transaction() as connection:
-                task = await repository.register_request(connection, app_id, payload.request_id, payload.workflow_id,
-                                                           self.payload("batch", payload.model_dump(), snapshot))
-                errors = await self.accept_rows(connection, task, [FileRow(i, row) for i, row in enumerate(payload.records, 1)])
+                task = await repository.register_request(connection, app_id, request_id, workflow_id,
+                                                           self.payload("batch", raw_payload, snapshot))
+                errors = await self.accept_rows(connection, task, rows)
                 data = {"inflow_type": "batch", "import_task_id": str(task.id),
                         "accepted_count": task.result["acceptedCount"], "rejected_count": task.result["rejectedCount"]}
                 task.result = {**task.result, "importStatus": "completed", "response": data, "errors": errors}
@@ -224,12 +273,35 @@ class InflowService:
                 task.finished_at = repository.utc_now()
                 await task.save(using_db=connection)
             logger.info("[Clue-Inflow] 【完成】批量线索受理已提交: task_id=%s, app_id=%r, request_id=%r, workflow_id=%r, accepted_count=%s, rejected_count=%s, duplicate_count=%s",
-                        task.id, app_id, payload.request_id, payload.workflow_id, task.result["acceptedCount"],
+                        task.id, app_id, request_id, workflow_id, task.result["acceptedCount"],
                         task.result["rejectedCount"], task.result["duplicateCount"])
             await self.dispatch_followup(task)
             return response(data, "accepted")
         except repository.RequestConflict as error:
             raise await repository.duplicate_request_error(error.key) from error
+
+    async def accept_batch(self, app_id, payload, allowed_workflows):
+        rows = [FileRow(i, row) for i, row in enumerate(payload.records, 1)]
+        return await self._accept_batch_core(
+            app_id, payload.request_id, payload.workflow_id, payload.model_dump(), rows, allowed_workflows
+        )
+
+    async def accept_batch_create(self, app_id, batch_req, allowed_workflows=None):
+        """统一 /clue/create/batch 与 /inflow/batch 的事务化受理入口。"""
+        request_id = batch_req.request_id or f"req_batch_{uuid.uuid4().hex[:12]}"
+        rows = []
+        for idx, rec in enumerate(batch_req.records, 1):
+            row_dict = rec if isinstance(rec, dict) else {
+                "clue_id": rec.clue_id,
+                "external_task_id": rec.external_task_id,
+                "phone_number": rec.phone_number,
+                "agent_data": self._merge_legacy_fields(rec),
+            }
+            rows.append(FileRow(idx, row_dict))
+        return await self._accept_batch_core(
+            app_id, request_id, batch_req.workflow_id, batch_req.model_dump(), rows,
+            allowed_workflows or ["*"],
+        )
 
     async def accept_rows(self, connection, task, rows):
         errors = []

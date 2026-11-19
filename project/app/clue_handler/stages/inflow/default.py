@@ -199,8 +199,23 @@ class DefaultInflowHandler(BaseInflowHandler):
         if intake_time < datenow:
             intake_time = datenow
 
-        # 工作时间校验 (9:00 - 21:00)
-        if 9 <= intake_time.hour < 21:
+        # 合规工时窗口校验 (动态读取策略/卡带工时，消除硬编码 9-21)
+        from app.strategy.agent_driven.tools import is_within_working_window, resolve_working_window
+        work_start, work_end = "09:00:00", "21:00:00"
+        try:
+            clue_rec = await crud.get_clue_info(clue.clueId)
+            if clue_rec and isinstance(clue_rec.clue_config, dict):
+                work_start, work_end = resolve_working_window(clue_rec.clue_config, work_start, work_end)
+            else:
+                engine = await self.get_engine_for_clue(clue)
+                cfg = getattr(engine, "strategy_config", None)
+                if cfg:
+                    work_start = getattr(cfg, "work_start_time", work_start)
+                    work_end = getattr(cfg, "work_end_time", work_end)
+        except Exception:
+            pass
+
+        if is_within_working_window(intake_time, work_start, work_end):
             success = await self.schedule_immediate_call(clue, intake_time)
         else:
             try:

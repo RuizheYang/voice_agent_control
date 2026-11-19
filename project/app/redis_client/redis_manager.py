@@ -90,7 +90,7 @@ class RedisManager:
                 # --- 核心修复：如果初始化过程中任何一步失败，必须立即关闭 client ---
                 # 这会关闭所有 startup_nodes 里的潜在连接，消除 Unclosed 警告
                 if client:
-                    await client.close()
+                    await client.aclose()
                 self._initialized = False
                 raise
 

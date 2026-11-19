@@ -67,7 +67,18 @@ class ClueHandlerFactory:
             from app.strategy.agent_driven.models import AgentStrategyConfig
 
             domain_pack = await domain_pack_registry.get_pack(target_wf)
+            work_start = followup.get("work_start_time") or followup.get("workStartTime") or domain_pack.work_start_time
+            work_end = followup.get("work_end_time") or followup.get("workEndTime") or domain_pack.work_end_time
             agent_cfg = AgentStrategyConfig(
+                work_start_time=work_start,
+                work_end_time=work_end,
+                max_call_num=followup.get("max_calls", followup.get("maxCalls", 10)),
+                noanswer_num=followup.get("max_no_answer_calls", followup.get("maxNoAnswerCalls", 4)),
+                max_calls_per_day=followup.get("max_call_per_day", followup.get("maxCallPerDay", 3)),
+                call_max_time=followup.get("max_followup_hours", followup.get("maxFollowupHours", 72)),
+                evaluation_mode=domain_pack.evaluation_mode,
+                workflow_id=target_wf,
+                max_touches_per_24h=domain_pack.max_touches_per_24h,
                 strategy_prompt=summary_prompt,
                 domain_master_prompt=domain_pack.domain_master_prompt,
                 allowed_handoff_targets=list(domain_pack.allowed_handoff_targets),
