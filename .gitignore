@@ -1,0 +1,114 @@
+# ==============================================================================
+# Python / Packaging / Build
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ==============================================================================
+# Virtual Environments & Tooling (uv / venv / pip)
+# ==============================================================================
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.uv/
+
+# ==============================================================================
+# Testing, Coverage & Linters
+# ==============================================================================
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+htmlcov/
+.hypothesis/
+junit-*.xml
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# ==============================================================================
+# Secrets, Env & Local Configs (Project Specific)
+# ==============================================================================
+.env
+.env.*
+!.env.example
+project/app/configs/*.json
+!project/app/configs/config.example.json
+*.pem
+*.key
+*.crt
+
+# ==============================================================================
+# Runtime Data: SQLite, Logs, Imports & Temp Files (Project Specific)
+# ==============================================================================
+project/dbfiles/*
+!project/dbfiles/.gitkeep
+dbfiles/*
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+project/logs/*
+!project/logs/.gitkeep
+logs/*
+*.log
+*.log.*
+
+tmp/
+*.tmp
+*.bak
+docker-compose.override.yml
+
+# ==============================================================================
+# OS & Editors / IDEs
+# ==============================================================================
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.iml
+*.swp
+*.swo
+*~
