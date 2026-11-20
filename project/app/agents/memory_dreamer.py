@@ -152,7 +152,8 @@ class MemoryDreamer:
             return ClueStructuredMemory()
 
         current = cls.load_memory(clue.agent_data)
-        if len(current.interaction_digest) < 3 and len(current.customer_notes) < 3:
+        handoff_history = list((clue.agent_data or {}).get("handoff_history") or [])
+        if len(current.interaction_digest) < 3 and len(current.customer_notes) < 3 and not handoff_history:
             return current
 
         try:
@@ -161,10 +162,12 @@ class MemoryDreamer:
             from pydantic_ai.providers.openai import OpenAIProvider
 
             llm_cfg = config.llm_factory_config
-            if not llm_cfg or not llm_cfg.base_url or not llm_cfg.api_key:
+            if not llm_cfg or not llm_cfg.base_url:
+                return current
+            if not llm_cfg.api_key and "openai.com" in llm_cfg.base_url:
                 return current
 
-            provider = OpenAIProvider(base_url=llm_cfg.base_url, api_key=llm_cfg.api_key)
+            provider = OpenAIProvider(base_url=llm_cfg.base_url, api_key=llm_cfg.api_key or "sk-dummy")
             model = OpenAIChatModel(llm_cfg.model_name or "gpt-4o-mini", provider=provider)
             dream_agent = Agent(model=model, output_type=SemanticDreamOutput, defer_model_check=True)
 
@@ -212,6 +215,50 @@ class MemoryDreamer:
         except Exception as err:
             logger.debug(f"[MemoryDreamer] 语义级 Dreaming Pass 降级跳过 (clue_id={clue_id}): {err}")
             return current
+
+    @classmethod
+    async def enqueue_memory_dream_task(
+        cls,
+        clue_id: str,
+        workflow_id: Optional[str] = None,
+        *,
+        reason: str = "digest_threshold",
+    ) -> Dict[str, Any]:
+        """
+        Cold-Path 持久任务投递：
+        将 Semantic Dreaming 落库为 ExecutionTask(task_type='memory_dream')，
+        由 InboxWakeupWorker 在持有 process_lock 下异步消费，避免进程崩溃丢任务。
+        """
+        import hashlib
+        import uuid
+        from datetime import datetime, timezone
+        from app.dbmodels.models import ExecutionTask
+
+        existing = await ExecutionTask.filter(
+            clue_id=clue_id,
+            task_type="memory_dream",
+            status__in=["pending", "retry", "processing"],
+        ).first()
+        if existing:
+            return {"queued": True, "duplicate": True, "task_id": existing.id}
+
+        now = datetime.now(timezone.utc)
+        key = hashlib.sha256(f"memory_dream:{clue_id}:{uuid.uuid4().hex}".encode("utf-8")).hexdigest()
+        task = await ExecutionTask.create(
+            task_key=key,
+            task_type="memory_dream",
+            workflow_id=workflow_id,
+            clue_id=clue_id,
+            payload={"clueId": clue_id, "reason": reason},
+            status="pending",
+            run_at=now,
+        )
+        try:
+            from app.agents.inbox_worker import notify_inbox_worker
+            notify_inbox_worker()
+        except Exception:
+            pass
+        return {"queued": True, "duplicate": False, "task_id": task.id}
 
     @classmethod
     def schedule_background_dream(

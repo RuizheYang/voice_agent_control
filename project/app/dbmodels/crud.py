@@ -418,7 +418,7 @@ async def create_call_record(
 
 async def create_call_end_record(call_end_request: CallEndRequest) -> CallRecord:
     """通话结束后落库 CallRecord"""
-    from app.call_schedule.callbacks import register_call_end
+    from app.call_schedule.callbacks import infer_telephony_facts, register_call_end
     managed_record = await register_call_end(call_end_request)
     data = call_end_request.data
     current_call = getattr(data, "currentCall", None)
@@ -430,6 +430,7 @@ async def create_call_end_record(call_end_request: CallEndRequest) -> CallRecord
             await managed_record.save()
         return managed_record
     outbound_report = getattr(data, "outboundReport", None)
+    facts = infer_telephony_facts(current_call, outbound_report)
 
     call_id = getattr(current_call, "callId", None) if current_call else None
     if not call_id:
@@ -440,9 +441,7 @@ async def create_call_end_record(call_end_request: CallEndRequest) -> CallRecord
     strategy_id = clue.strategy_id if clue else "default"
     attempt_no = clue.total_call_count if clue and clue.total_call_count > 0 else 1
 
-    answered_flag = None
-    if outbound_report and outbound_report.callAnswered is not None:
-        answered_flag = 1 if bool(outbound_report.callAnswered) else 0
+    answered_flag = facts["answered"]
 
     snapshot = dict(clue.clue_config or {}) if clue else {}
     if current_call and getattr(current_call, "aiCallContextList", None):
@@ -457,6 +456,10 @@ async def create_call_end_record(call_end_request: CallEndRequest) -> CallRecord
             "attempt_no": attempt_no,
             "status": "ended",
             "answered": answered_flag,
+            "outcome": facts["outcome"],
+            "duration_seconds": facts["duration_seconds"],
+            "provider_result_code": facts["provider_result_code"],
+            "provider_result_message": facts["provider_result_message"],
             "ended_at": get_now(),
             "scheduled_at": get_now(),
             "config_snapshot": snapshot,
@@ -469,9 +472,19 @@ async def create_call_end_record(call_end_request: CallEndRequest) -> CallRecord
         record.config_snapshot = existing_snap
         await record.save()
 
-    if answered_flag is not None:
+    dirty_fields = []
+    if answered_flag is not None and (record.answered is None or (outbound_report and outbound_report.callAnswered is not None)):
         record.answered = answered_flag
+        dirty_fields.append("answered")
+    if record.outcome is None and facts["outcome"] is not None:
+        record.outcome = facts["outcome"]
+        dirty_fields.append("outcome")
+    if record.duration_seconds is None and facts["duration_seconds"] is not None:
+        record.duration_seconds = facts["duration_seconds"]
+        dirty_fields.append("duration_seconds")
+    if dirty_fields:
         record.status = "ended"
+        dirty_fields.append("status")
         await record.save()
 
     return record
@@ -861,6 +874,9 @@ async def atomic_handoff_clue_workflow(
             status__in=["pending", "retry"],
         ).using_db(connection).update(status="cancelled", last_error=f"handoff_to:{target_workflow_id}")
 
+        from app.agents.memory_dreamer import MemoryDreamer
+
+        directive_text = f"[跨业务交接:{prev_workflow}->{target_workflow_id}] {handoff_summary}"
         history.append({
             "from_workflow": prev_workflow,
             "to_workflow": target_workflow_id,
@@ -869,7 +885,13 @@ async def atomic_handoff_clue_workflow(
         })
         agent_data["handoff_history"] = history
         agent_data["handoff_context"] = handoff_summary
-        agent_data["agent_directive"] = f"[跨业务交接:{prev_workflow}->{target_workflow_id}] {handoff_summary}"
+        agent_data = MemoryDreamer.apply_to_agent_data(
+            agent_data,
+            directive=directive_text,
+            customer_facts={"handoff_context": handoff_summary},
+            digest_entry=directive_text,
+            progress=f"handoff:{target_workflow_id}",
+        )
 
         # 同步刷新目标策略的 clue_config 快照，防止后续排期仍沿用旧业务线路与频控配置
         target_strategy = await OutboundStrategy.filter(strategy_id=target_strategy_id).using_db(connection).first()

@@ -11,6 +11,7 @@ from app.strategy.agent_driven.models import (
     ObjectionAnalysisOutput,
     AppointmentAnalysisOutput,
     SentimentAnalysisOutput,
+    MasterSummaryDecision,
 )
 from app.strategy.agent_driven.prompts import (
     INTENT_ANALYSIS_PROMPT,
@@ -47,6 +48,47 @@ def build_declarative_output_model(name: str, output_fields: Dict[str, str]) -> 
     fields_spec.setdefault("summary", (str, Field(default="", description="维度分析摘要")))
     safe_cls_name = f"DynEval_{''.join(c if c.isalnum() else '_' for c in name)}"
     return create_model(safe_cls_name, **fields_spec)
+
+
+def build_single_pass_decision_model(
+    workflow_id: str,
+    custom_evaluators: Optional[List[Any]] = None,
+) -> Type[MasterSummaryDecision]:
+    """
+    通过 pydantic.create_model 将业务卡带的 custom_evaluators 字段与 MasterSummaryDecision
+    动态合成为 Tier 1 Single-Pass 强类型复合结构化输出 Schema。
+    """
+    specs = list(custom_evaluators or [])
+    if not specs:
+        return MasterSummaryDecision
+
+    findings_fields: Dict[str, Any] = {}
+    for spec in specs:
+        name = spec.get("name") if isinstance(spec, dict) else getattr(spec, "name", None)
+        if not name:
+            continue
+        prompt = spec.get("prompt") if isinstance(spec, dict) else getattr(spec, "prompt", "")
+        output_fields = spec.get("output_fields") if isinstance(spec, dict) else getattr(spec, "output_fields", {})
+        sub_model = build_declarative_output_model(str(name), dict(output_fields or {}))
+        safe_field = "".join(c if c.isalnum() or c == "_" else "_" for c in str(name))
+        findings_fields[safe_field] = (
+            Optional[sub_model],
+            Field(default=None, description=str(prompt or name)),
+        )
+
+    if not findings_fields:
+        return MasterSummaryDecision
+
+    safe_wf = "".join(c if c.isalnum() else "_" for c in (workflow_id or "default"))
+    findings_cls = create_model(f"DynFindings_{safe_wf}", **findings_fields)
+    return create_model(
+        f"SinglePassDecision_{safe_wf}",
+        __base__=MasterSummaryDecision,
+        custom_evaluator_findings=(
+            Optional[findings_cls],
+            Field(default=None, description="业务卡带专属评估器强类型提取结论"),
+        ),
+    )
 
 
 @dataclass

@@ -233,18 +233,14 @@ class DefaultPostCallHandler(BasePostCallHandler):
             # ==================== 下一轮追呼排期推演与终态流转 ====================
             try:
                 from app.strategy.contracts import ClueContext
+                from app.agents.contracts import is_channel_success_event
                 from app.dbmodels.models import ClueInfo, OutboundStrategy, ExecutionTask
                 from app.observability.events_bus import event_bus, ClueEndEvent
                 from app.utils.time_utils import get_now
 
                 # Per-Clue Event Coalescing: 若合并窗口内已有渠道成功事件（如企微通过），直接收口 ACCEPTED 并跳过排期
                 for ev in (coalesced_events or []):
-                    ev_data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
-                    is_ch_success = (
-                        ev.get("type") == "channel_notify"
-                        and (ev.get("success") is True or str(ev_data.get("resultCode", "")) == "3")
-                    )
-                    if is_ch_success:
+                    if is_channel_success_event(ev):
                         await ExecutionTask.filter(
                             clue_id=clue_id,
                             task_type__in=["agent_wakeup", "call"],
@@ -282,6 +278,10 @@ class DefaultPostCallHandler(BasePostCallHandler):
                     engine = self.resolve_engine(schedule_id)
 
                 context = await ClueContext.from_db(clue_id)
+                if clue and getattr(clue, "workflow_id", None):
+                    context.workflow_id = clue.workflow_id
+                if coalesced_events:
+                    context.coalesced_events = list(coalesced_events)
                 if clue and isinstance(getattr(clue, "agent_data", None), dict):
                     try:
                         from app.agents.memory_dreamer import MemoryDreamer
@@ -352,22 +352,24 @@ class DefaultPostCallHandler(BasePostCallHandler):
                     else:
                         effective_directive = handoff_prefix or effective_directive
 
-                # 在持锁主协程内同步原子合并 4 桶记忆，消除并发写覆盖竞态
+                # Hot-Path 事务悲观锁内同步原子合并 4 桶记忆，Cold-Path 投递持久化 memory_dream 任务
                 custom_facts = getattr(master_dec, "custom_evaluator_findings", None) if master_dec else None
                 if clue:
                     try:
                         from app.agents.memory_dreamer import MemoryDreamer
-                        clue.agent_data = MemoryDreamer.apply_to_agent_data(
-                            clue.agent_data,
+                        mem_obj = await MemoryDreamer.curate_and_persist(
+                            clue_id,
                             directive=effective_directive,
                             customer_facts=custom_facts if isinstance(custom_facts, dict) else None,
                             digest_entry=call_summary or schedule_result.reason,
                             progress=getattr(schedule_result, "business_status", None) or "followup",
                         )
-                        await clue.save(update_fields=["agent_data", "update_time"])
-                        mem_obj = MemoryDreamer.load_memory(clue.agent_data)
-                        if len(mem_obj.interaction_digest) >= 3 or handoff_succeeded:
-                            MemoryDreamer.schedule_background_dream(clue_id, run_semantic=True)
+                        if len(mem_obj.interaction_digest) >= 4 or handoff_succeeded:
+                            await MemoryDreamer.enqueue_memory_dream_task(
+                                clue_id,
+                                workflow_id=clue.workflow_id,
+                                reason="handoff" if handoff_succeeded else "digest_threshold",
+                            )
                     except Exception as dir_err:
                         logger.warning(f"[PostCallHandler] 持久化 Agent 决策与四桶记忆异常: {dir_err}")
 
@@ -391,6 +393,52 @@ class DefaultPostCallHandler(BasePostCallHandler):
                     if cur_st != ClueState.AWAITING_APPROVAL.value:
                         await crud.update_clue_state_or_raise(clue_id, ClueState.AWAITING_APPROVAL.value)
                     logger.info(f"[PostCallHandler] 高危工具等待人工审批，线索挂起为 AWAITING_APPROVAL: clue_id={clue_id}")
+                    return True
+
+                # 若 SupervisorAgent 在 Single-Pass 中已通过 ToolBus 实际执行终态/渠道/排期工具，避免后置处理器重复流转或重复排期
+                tool_execs = getattr(master_dec, "tool_executions", None) or []
+                tool_terminated = any(
+                    ex.get("tool_name") == "tool_terminate_clue"
+                    and isinstance(ex.get("result"), dict)
+                    and ex["result"].get("terminated") is True
+                    for ex in tool_execs
+                )
+                tool_scheduled_task_id = next(
+                    (
+                        ex["result"].get("task_id")
+                        for ex in tool_execs
+                        if ex.get("tool_name") == "tool_schedule_followup"
+                        and isinstance(ex.get("result"), dict)
+                        and ex["result"].get("scheduled") is True
+                    ),
+                    None,
+                )
+                tool_wechat_pending = any(
+                    ex.get("tool_name") == "tool_trigger_channel_action"
+                    and isinstance(ex.get("result"), dict)
+                    and ex["result"].get("triggered") is True
+                    and ex["result"].get("channel") == "wechat"
+                    for ex in tool_execs
+                )
+                current_clue_state = await crud.get_clue_state(clue_id)
+                if tool_terminated or current_clue_state in (ClueState.ACCEPTED.value, ClueState.REJECTED.value):
+                    logger.info(f"[PostCallHandler] ToolBus 已完成线索终态收口 ({current_clue_state})，跳过重复流转: clue_id={clue_id}")
+                    return True
+                if tool_wechat_pending or (current_clue_state == ClueState.PENDING.value and not tool_scheduled_task_id):
+                    logger.info(f"[PostCallHandler] 线索已由 ToolBus 置为 PENDING 等待渠道结果，跳过重复排期: clue_id={clue_id}")
+                    return True
+                if tool_scheduled_task_id:
+                    logger.info(f"[PostCallHandler] ToolBus 已创建排期任务 task_id={tool_scheduled_task_id}，跳过重复 schedule_call: clue_id={clue_id}")
+                    try:
+                        scheduled_task = await ExecutionTask.filter(id=tool_scheduled_task_id).first()
+                        if scheduled_task and scheduled_task.run_at:
+                            await dispatch_webhook_event(
+                                event="call_scheduled",
+                                clue_id=clue_id,
+                                data={"scheduled_timestamp": int(scheduled_task.run_at.timestamp() * 1000)},
+                            )
+                    except Exception as sch_err:
+                        logger.warning(f"[PostCallHandler] 触发 call_scheduled 回推失败: {sch_err}")
                     return True
 
                 # 消费 Agent 驱动的 4 态终态标准

@@ -181,3 +181,25 @@ class AgentRuntimeDeps(BaseModel):
     recent_24h_touches: int = 0
     coalesced_events: List[Dict[str, Any]] = Field(default_factory=list)
     dry_run: bool = False
+
+
+class WakeupEvaluationContext(BaseModel):
+    """Always-On 认知唤醒 Run 的结构化上下文快照"""
+    clue_id: str
+    workflow_id: str = "default"
+    current_status: str = ""
+    check_goal: str = ""
+    coalesced_events: List[Dict[str, Any]] = Field(default_factory=list)
+    memory_index: str = ""
+    recent_24h_touches: int = 0
+    max_touches_per_24h: int = 5
+    remaining_touches_today: int = 5
+    approval_notes: List[str] = Field(default_factory=list)
+
+
+def is_channel_success_event(event: Dict[str, Any]) -> bool:
+    """统一判断合并事件中是否包含渠道添加成功信号（兼容 success=True 与 data.resultCode=='3'）"""
+    if not isinstance(event, dict) or event.get("type") != "channel_notify":
+        return False
+    ev_data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    return event.get("success") is True or str(ev_data.get("resultCode", "")) == "3"

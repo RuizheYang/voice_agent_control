@@ -4,6 +4,7 @@
 真实回调可确认 processing/unknown 送号任务成功；结束后的 summary 流转由 ClueHandler 完成。
 """
 from datetime import datetime, timezone
+import json
 import logging
 
 from tortoise.expressions import Q
@@ -13,6 +14,55 @@ from app.dbmodels.models import CallRecord, ClueInfo, ExecutionTask
 from app.utils.exceptions import StateTransitionError
 
 logger = logging.getLogger(__name__)
+
+
+def _has_user_turn(raw_context) -> bool:
+    """判断通话上下文中是否存在客户实际发言轮次（排除纯机器人开场白/空内容）"""
+    if isinstance(raw_context, str):
+        try:
+            raw_context = json.loads(raw_context)
+        except Exception:
+            return False
+    if not isinstance(raw_context, list):
+        return False
+    for item in raw_context:
+        if not isinstance(item, dict):
+            continue
+        sender = str(item.get("sender") or item.get("role") or "").strip().lower()
+        text = str(item.get("text") or item.get("content") or "").strip()
+        if not text or text.startswith("Call the "):
+            continue
+        if sender not in ("robot", "assistant", "system"):
+            return True
+    return False
+
+
+def infer_telephony_facts(current_call, outbound_report=None) -> dict:
+    """从 currentCall 与 outboundReport 统一提取 answered / duration_seconds / outcome"""
+    raw_duration = getattr(current_call, "aiCallSeconds", None) if current_call else None
+    duration_seconds = int(raw_duration) if isinstance(raw_duration, (int, float)) and raw_duration >= 0 else None
+    result_code = getattr(current_call, "resultCode", None) if current_call else None
+    result_msg = getattr(current_call, "resultMsg", None) if current_call else None
+
+    if outbound_report and getattr(outbound_report, "callAnswered", None) is not None:
+        answered = int(bool(outbound_report.callAnswered))
+    elif current_call and _has_user_turn(getattr(current_call, "aiCallContextList", None)):
+        answered = 1
+    elif current_call and ((duration_seconds is not None and duration_seconds > 0) or getattr(current_call, "talkStartTime", None)):
+        answered = 1
+    elif current_call is not None:
+        answered = 0
+    else:
+        answered = None
+
+    outcome = "answered" if answered == 1 else ("no_answer" if answered == 0 else None)
+    return {
+        "answered": answered,
+        "duration_seconds": duration_seconds,
+        "outcome": outcome,
+        "provider_result_code": str(result_code)[:64] if result_code is not None else None,
+        "provider_result_message": str(result_msg)[:512] if result_msg is not None else None,
+    }
 
 
 async def resolve_record(connection, clue_id, call_id, provider_call_id=None, batch_id=None):
@@ -111,8 +161,19 @@ async def register_call_end(request):
             if record.started_at is None and clue and clue.last_call_id == record.call_id:
                 clue.total_call_count += 1  # 无开始通知也不能漏计；结束记录使重复回调不再累加。
             report = request.data.outboundReport
+            facts = infer_telephony_facts(request.data.currentCall, report)
             if report and report.callAnswered is not None:
                 record.answered = int(bool(report.callAnswered))
+            elif record.answered is None and facts["answered"] is not None:
+                record.answered = facts["answered"]
+            if record.duration_seconds is None and facts["duration_seconds"] is not None:
+                record.duration_seconds = facts["duration_seconds"]
+            if record.outcome is None and record.answered is not None:
+                record.outcome = "answered" if record.answered == 1 else "no_answer"
+            if record.provider_result_code is None and facts["provider_result_code"] is not None:
+                record.provider_result_code = facts["provider_result_code"]
+            if record.provider_result_message is None and facts["provider_result_message"] is not None:
+                record.provider_result_message = facts["provider_result_message"]
             if clue and clue.last_call_id == record.call_id:
                 if record.answered == 1:
                     clue.no_answer_count = 0

@@ -7,7 +7,6 @@ from fastapi import APIRouter, HTTPException, Path
 from pydantic import BaseModel, Field
 
 from app.agents.domain_registry import domain_pack_registry
-from app.agents.memory_dreamer import MemoryDreamer
 from app.agents.supervisor import clue_supervisor_agent
 from app.agents.tool_bus import execute_tool_by_name
 from app.apis.telephony import render_dynamic_agent_context
@@ -34,6 +33,46 @@ class InCallHandoffRequest(BaseModel):
     handoff_summary: str = Field(..., min_length=1, description="跨业务交接背景摘要")
 
 
+async def _resolve_agent_runtime_payload(
+    agent_id: str,
+    agent_data: Optional[Dict[str, Any]],
+    fallback_instruction: str,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """读取 VoiceAgent 音色/模型配置并渲染跨轮记忆上下文，供 /bootstrap 与 /handoff 共用。"""
+    voice_agent = await crud.get_voice_agent_config_by_id(agent_id)
+    if voice_agent:
+        gs = voice_agent.globalSettings or {}
+        agent_config = {
+            "agent_id": voice_agent.agent_id,
+            "agent_name": voice_agent.agent_name,
+            "version": voice_agent.version,
+            "instruction": voice_agent.instruction,
+            "open_message": voice_agent.open_message,
+            "global_settings": gs,
+        }
+        voice_config = {
+            "agent_id": voice_agent.agent_id,
+            "agent_name": voice_agent.agent_name,
+            "version": voice_agent.version,
+            "open_message": voice_agent.open_message,
+            "tts": gs.get("tts"),
+            "stt": gs.get("stt"),
+            "llm": gs.get("llm"),
+        }
+    else:
+        agent_config = {"agent_id": agent_id, "instruction": fallback_instruction}
+        voice_config = {
+            "agent_id": agent_id,
+            "version": "realtime",
+            "open_message": None,
+            "tts": None,
+            "stt": None,
+            "llm": None,
+        }
+    rendered = render_dynamic_agent_context(agent_config, agent_data)
+    return voice_config, rendered
+
+
 @router.get("/{clue_id}/bootstrap", summary="通话中实时加载线索记忆、业务卡带、Flow 节点与工具契约")
 async def in_call_bootstrap(clue_id: str = Path(..., description="线索唯一 ID")):
     """
@@ -47,21 +86,9 @@ async def in_call_bootstrap(clue_id: str = Path(..., description="线索唯一 I
     deps = await clue_supervisor_agent.build_runtime_deps(clue_id, workflow_id=clue.workflow_id)
     pack = deps.domain_pack
     visible_tools = await clue_supervisor_agent.inspect_visible_tools(deps)
-
-    voice_agent = await crud.get_voice_agent_config_by_id(clue.agent_id)
-    agent_config = (
-        {
-            "agent_id": voice_agent.agent_id,
-            "agent_name": voice_agent.agent_name,
-            "version": voice_agent.version,
-            "instruction": voice_agent.instruction,
-            "open_message": voice_agent.open_message,
-            "global_settings": voice_agent.globalSettings,
-        }
-        if voice_agent
-        else {"agent_id": clue.agent_id, "instruction": pack.domain_master_prompt or ""}
+    voice_config, rendered = await _resolve_agent_runtime_payload(
+        clue.agent_id, clue.agent_data, pack.domain_master_prompt or ""
     )
-    rendered = render_dynamic_agent_context(agent_config, clue.agent_data)
 
     return {
         "code": 0,
@@ -76,6 +103,7 @@ async def in_call_bootstrap(clue_id: str = Path(..., description="线索唯一 I
             "domain_description": pack.domain_description,
             "domain_master_prompt": pack.domain_master_prompt,
             "in_call_flow": pack.in_call_flow,
+            "voice_config": voice_config,
             "structured_memory": deps.structured_memory.model_dump(mode="json"),
             "memory_index": rendered["memoryIndex"],
             "agent_directive": rendered["agentDirective"],
@@ -152,14 +180,12 @@ async def in_call_realtime_handoff(
             "data": handoff_res,
         }
 
-    # 同步将交接摘要沉淀入四桶记忆
-    await MemoryDreamer.curate_and_persist(
-        clue_id,
-        directive=f"[通话中热切换 {handoff_res.get('from_workflow')}->{request.target_workflow_id}] {request.handoff_summary}",
-        digest_entry=f"[Mid-Call Handoff] {request.handoff_summary}",
-        progress=f"in_call_handoff:{request.target_workflow_id}",
+    updated_clue = await crud.get_clue_info(clue_id)
+    voice_config, rendered = await _resolve_agent_runtime_payload(
+        target_pack.voice_agent_id,
+        updated_clue.agent_data if updated_clue else {},
+        target_pack.domain_master_prompt or "",
     )
-
     new_deps = await clue_supervisor_agent.build_runtime_deps(
         clue_id, workflow_id=request.target_workflow_id
     )
@@ -181,8 +207,16 @@ async def in_call_realtime_handoff(
                 "domain_description": target_pack.domain_description,
                 "domain_master_prompt": target_pack.domain_master_prompt,
                 "in_call_flow": target_pack.in_call_flow,
+                "voice_config": voice_config,
+                "dynamic_instruction": rendered["dynamicInstruction"],
+                "open_message": rendered["openMessage"],
             },
-            "memory_index": new_deps.structured_memory.to_compact_index(),
+            "voice_config": voice_config,
+            "dynamic_instruction": rendered["dynamicInstruction"],
+            "agent_directive": rendered["agentDirective"],
+            "open_message": rendered["openMessage"],
+            "structured_memory": new_deps.structured_memory.model_dump(mode="json"),
+            "memory_index": rendered["memoryIndex"],
             "visible_tools": new_tools,
         },
     }

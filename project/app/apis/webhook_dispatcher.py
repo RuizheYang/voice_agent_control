@@ -115,12 +115,14 @@ async def _send_http_with_retry(
     event: str,
     event_id: str,
     clue_id: str,
+    max_retries: Optional[int] = None,
 ) -> bool:
     """
     执行 HTTP POST 回调，包含 10 秒超时及最多 3 次重试 (基于 Retail AI Webhook Spec)。
     底层统一复用 api_calls.do_post 连接池与重试机制。
     使用方需根据 event_id 实现消费幂等。
     """
+    effective_retries = MAX_WEBHOOK_RETRIES if max_retries is None else max(0, int(max_retries))
     headers = {
         "Content-Type": "application/json",
         "X-Event-Id": event_id,
@@ -138,7 +140,7 @@ async def _send_http_with_retry(
             payload=payload,
             clue_id=clue_id,
             timeout_seconds=WEBHOOK_TIMEOUT_SECONDS,
-            retry_times=1 + MAX_WEBHOOK_RETRIES,
+            retry_times=1 + effective_retries,
             retry_interval_seconds=WEBHOOK_RETRY_BACKOFF,
             should_retry_fn=should_retry_webhook,
         )
@@ -156,10 +158,60 @@ async def _send_http_with_retry(
             return False
     except Exception as e:
         logger.error(
-            f"[Webhook] 事件推送失败且重试耗尽 (共尝试 {1 + MAX_WEBHOOK_RETRIES} 次): "
+            f"[Webhook] 事件推送失败且重试耗尽 (共尝试 {1 + effective_retries} 次): "
             f"event={event}, event_id={event_id}, clue_id={clue_id}, err={e}"
         )
         return False
+
+
+async def enqueue_webhook_delivery_task(
+    *,
+    callback_url: str,
+    payload: Dict[str, Any],
+    event: str,
+    event_id: str,
+    clue_id: str,
+    workflow_id: Optional[str] = None,
+    call_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    将异步 Webhook 投递持久化为 ExecutionTask(task_type='webhook_delivery')，
+    由 InboxWakeupWorker 统一消费并执行持久化指数退避重试，避免进程重启丢任务。
+    """
+    import hashlib
+    from datetime import datetime, timezone
+    from app.dbmodels.models import ExecutionTask
+
+    now = datetime.now(timezone.utc)
+    task_key = hashlib.sha256(f"webhook_delivery:{event_id}".encode("utf-8")).hexdigest()
+    existing = await ExecutionTask.filter(task_key=task_key).first()
+    if existing:
+        return {"queued": True, "duplicate": True, "task_id": existing.id}
+
+    task = await ExecutionTask.create(
+        task_key=task_key,
+        task_type="webhook_delivery",
+        event_id=event_id,
+        workflow_id=workflow_id,
+        clue_id=clue_id,
+        call_id=call_id,
+        payload={
+            "callback_url": callback_url,
+            "payload": payload,
+            "event": event,
+            "event_id": event_id,
+            "clue_id": clue_id,
+        },
+        max_retries=MAX_WEBHOOK_RETRIES,
+        status="pending",
+        run_at=now,
+    )
+    try:
+        from app.agents.inbox_worker import notify_inbox_worker
+        notify_inbox_worker()
+    except Exception:
+        pass
+    return {"queued": True, "duplicate": False, "task_id": task.id}
 
 async def dispatch_webhook_event(
     event: str,
@@ -254,26 +306,13 @@ async def dispatch_webhook_event(
             pass
         return success
     else:
-        async def _do_send_and_update():
-            success = await _send_http_with_retry(
-                callback_url=callback_url,
-                payload=payload,
-                event=canonical_event,
-                event_id=event_id,
-                clue_id=clue_id,
-            )
-            try:
-                from app.dbmodels.models import ExecutionTask
-                from app.utils.time_utils import get_now
-                await ExecutionTask.filter(event_id=event_id).update(
-                    status="succeeded" if success else "failed",
-                    finished_at=get_now(),
-                    last_error=None if success else "Webhook delivery failed after retries"
-                )
-            except Exception:
-                pass
-            return success
-
-        # 非阻塞触发，确保即便网络超时或重试也不会阻塞呼叫与流转
-        asyncio.create_task(_do_send_and_update())
+        await enqueue_webhook_delivery_task(
+            callback_url=callback_url,
+            payload=payload,
+            event=canonical_event,
+            event_id=event_id,
+            clue_id=clue_id,
+            workflow_id=workflow_id,
+            call_id=call_id,
+        )
         return True

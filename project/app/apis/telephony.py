@@ -45,10 +45,34 @@ async def send_call(request: ScheduledCallRequest, *, line_type: LineType,
         try:
             config = record.config_snapshot["config"]
             agent_config = record.config_snapshot.get("agentConfig") or config.get("agentConfig")
-            if not record.config_snapshot.get("telephonyRequest") and agent_config is None:
-                agent_config = await asyncio.wait_for(
-                    loader(record.agent_id, copy.deepcopy(config.get("sip") or {})),
-                    timeout=settings.http_timeout_seconds)
+            if not record.config_snapshot.get("telephonyRequest"):
+                # 冻结送号参数前刷新最新 ClueInfo.agent_data，确保后台 memory_dream / 渠道记忆生效
+                try:
+                    from app.dbmodels import crud
+                    latest_clue = await crud.get_clue_info(record.clue_id)
+                    if latest_clue and isinstance(getattr(latest_clue, "agent_data", None), dict) and latest_clue.agent_data:
+                        record.config_snapshot = {
+                            **record.config_snapshot,
+                            "agentData": copy.deepcopy(latest_clue.agent_data),
+                        }
+                except Exception:
+                    pass
+                if agent_config is None:
+                    try:
+                        agent_config = await asyncio.wait_for(
+                            loader(record.agent_id, copy.deepcopy(config.get("sip") or {})),
+                            timeout=settings.http_timeout_seconds)
+                    except AgentConfigurationPending as pending_err:
+                        if _active_gateway_mode() in ("livekit", "pipecat") and str(pending_err) == "agent_config_missing":
+                            agent_config = {
+                                "agent_id": record.agent_id,
+                                "version": "realtime",
+                                "status": "active",
+                                "call_type": "outbound",
+                                "global_settings": {},
+                            }
+                        else:
+                            raise
             freeze_telephony_request(record, agent_config, now=scheduler.clock(), line_type=line_type)
         except AgentConfigurationPending as error:
             return str(error)
@@ -107,6 +131,7 @@ async def send_call(request: ScheduledCallRequest, *, line_type: LineType,
                 "agent_id": record.agent_id,
                 "agent_version": agent_ver,
                 "line_type": line_type.value,
+                "gateway_mode": tele_meta.get("gatewayMode") or _active_gateway_mode(),
                 "accessor_id": tele_dict.get("accessorId"),
                 "strategy_id": tele_dict.get("strategyId"),
                 "speechcraft_id": tele_dict.get("speechcraftId"),
@@ -133,6 +158,13 @@ class AgentConfigurationPending(Exception):
     """Agent配置来源或必要的话务映射未准备好，任务应延期而不是结束线索。"""
 
 
+def _active_gateway_mode() -> str:
+    """解析当前生效的话务网关模式（优先读取环境变量，其次全局配置）。"""
+    from app.config import config
+
+    return (os.getenv("TELEPHONY_GATEWAY_MODE") or config.call_request_config.gateway_mode or "mock").strip().lower()
+
+
 def _validate_agent_config(agent_id, agent_config, *, gateway_mode: Optional[str] = None):
     """校验送号需要的Agent配置，返回明确配置的speechcraftId。"""
     if not isinstance(agent_config, dict) or agent_config.get("agent_id") != agent_id:
@@ -147,7 +179,7 @@ def _validate_agent_config(agent_id, agent_config, *, gateway_mode: Optional[str
     settings = agent_config.get("global_settings")
     tts = settings.get("tts") if isinstance(settings, dict) else None
     speechcraft_id = tts.get("provider_id") if isinstance(tts, dict) else None
-    mode = (gateway_mode or os.getenv("TELEPHONY_GATEWAY_MODE") or "").strip().lower()
+    mode = (gateway_mode or _active_gateway_mode()).strip().lower()
     if not isinstance(speechcraft_id, str) or not speechcraft_id.strip():
         if mode in ("livekit", "pipecat"):
             return f"realtime_{agent_id}"
@@ -201,7 +233,7 @@ async def load_agent_config(agent_id, sip):
         "agent_type": agent.agent_type, "open_message": agent.open_message, "call_type": agent.call_type,
     }
     try:
-        _validate_agent_config(agent_id, config)
+        _validate_agent_config(agent_id, config, gateway_mode=_active_gateway_mode())
     except AgentConfigurationPending as error:
         logger.warning("[Telephony] 【配置等待】Agent配置暂不可用: agent_id=%r, code=%s", agent_id, str(error))
         raise
@@ -217,14 +249,27 @@ def as_utc(value):
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
-def build_telephony_params(record, agent_config, *, now, line_type: LineType):
+def _resolve_window_end(config: dict, expires_at: Optional[str], *, now) -> tuple[datetime, datetime]:
+    """校验并返回本地当前时间与本次合法呼叫截止时间，供传统网关与实时网关共用。"""
     from app.strategy.agent_driven.tools import (
         is_within_working_window,
         resolve_working_window,
         working_window_end_for_date,
     )
+
+    local = as_utc(now).astimezone(ZoneInfo(config.get("timezone", "Asia/Shanghai")))
+    work_start, work_end = resolve_working_window(config)
+    end = working_window_end_for_date(local, work_end)
+    if expires_at:
+        end = min(end, as_utc(datetime.fromisoformat(expires_at)).astimezone(local.tzinfo))
+    if not is_within_working_window(local, work_start, work_end) or end <= local:
+        raise ValueError("outside call window")
+    return local, end
+
+
+def build_telephony_params(record, agent_config, *, now, line_type: LineType):
     line_type = LineType(line_type)
-    speechcraft_id = _validate_agent_config(record.agent_id, agent_config)
+    speechcraft_id = _validate_agent_config(record.agent_id, agent_config, gateway_mode=_active_gateway_mode())
     snapshot = record.config_snapshot
     config = snapshot["config"]
     sip = config.get("sip") or {}
@@ -240,13 +285,7 @@ def build_telephony_params(record, agent_config, *, now, line_type: LineType):
         raise AgentConfigurationPending("sip_line_missing")
     from app.utils.decrypt import crypted_manager
     phone = crypted_manager.decrypt_field(snapshot["phoneNumber"])
-    local = as_utc(now).astimezone(ZoneInfo(config.get("timezone", "Asia/Shanghai")))
-    work_start, work_end = resolve_working_window(config)
-    end = working_window_end_for_date(local, work_end)
-    if snapshot.get("expiresAt"):
-        end = min(end, as_utc(datetime.fromisoformat(snapshot["expiresAt"])).astimezone(local.tzinfo))
-    if not is_within_working_window(local, work_start, work_end) or end <= local:
-        raise ValueError("outside call window")
+    local, end = _resolve_window_end(config, snapshot.get("expiresAt"), now=now)
     rendered = render_dynamic_agent_context(agent_config, data)
     context = {
         "clueId": record.clue_id,
@@ -274,6 +313,31 @@ def freeze_telephony_request(record, agent_config, *, now, line_type: LineType):
     """调用方与submitting状态在同一DB事务保存此快照，HTTP前不另开写事务。"""
     from app.utils.decrypt import crypted_manager, IT_VERSION_LABEL
     line_type = LineType(line_type)
+    mode = _active_gateway_mode()
+    if mode in ("livekit", "pipecat"):
+        meta = record.config_snapshot.get("telephonyMetadata") or {}
+        if meta.get("gatewayMode") == mode and meta.get("execEndTime"):
+            zone = ZoneInfo(record.config_snapshot["config"].get("timezone", "Asia/Shanghai"))
+            end = datetime.strptime(meta["execEndTime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=zone)
+            if end > as_utc(now):
+                return
+            if getattr(record, "status", "created") != "created":
+                raise AgentConfigurationPending("previous_submission_unconfirmed")
+            agent_config = record.config_snapshot.get("agentConfig") or agent_config
+        _validate_agent_config(record.agent_id, agent_config, gateway_mode=mode)
+        config = record.config_snapshot["config"]
+        _, end = _resolve_window_end(config, record.config_snapshot.get("expiresAt"), now=now)
+        record.config_snapshot = {
+            **record.config_snapshot,
+            "agentConfig": copy.deepcopy(agent_config),
+            "telephonyMetadata": {
+                "gatewayMode": mode,
+                "agentVersion": agent_config["version"],
+                "lineType": line_type.value,
+                "execEndTime": end.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        }
+        return
     if record.config_snapshot.get("telephonyRequest"):
         previous = TelephonyAPI.model_validate(json.loads(crypted_manager.decrypt_field(record.config_snapshot["telephonyRequest"])))
         previous_type = record.config_snapshot.get("telephonyMetadata", {}).get("lineType")
@@ -668,7 +732,6 @@ class PipecatTelephonyGateway(BaseTelephonyGateway):
         snapshot = getattr(record, "config_snapshot", None) or {}
         agent_data = snapshot.get("agentData") or {}
         agent_config = snapshot.get("agentConfig") or {}
-        rendered = render_dynamic_agent_context(agent_config, agent_data)
 
         phone = snapshot.get("phoneNumber", "")
         if phone and len(str(phone)) > 20:
@@ -683,11 +746,14 @@ class PipecatTelephonyGateway(BaseTelephonyGateway):
             from app.agents.domain_registry import domain_pack_registry
             from app.dbmodels import crud
             clue = await crud.get_clue_info(record.clue_id)
+            if clue and isinstance(getattr(clue, "agent_data", None), dict) and clue.agent_data:
+                agent_data = dict(clue.agent_data)
             wf_id = clue.workflow_id if clue else "default"
             pack = await domain_pack_registry.get_pack(wf_id)
             in_call_flow = pack.in_call_flow
         except Exception:
             pass
+        rendered = render_dynamic_agent_context(agent_config, agent_data)
 
         control_base = os.getenv("CONTROL_PLANE_BASE_URL", "http://localhost:8001").rstrip("/")
         return {
@@ -741,7 +807,7 @@ def resolve_telephony_gateway() -> BaseTelephonyGateway:
     """根据配置解析生效的话务网关实现（支持 mock / webhook / livekit / pipecat）"""
     from app.config import config
 
-    mode = (os.getenv("TELEPHONY_GATEWAY_MODE") or config.call_request_config.gateway_mode or "mock").strip().lower()
+    mode = _active_gateway_mode()
     if mode == "livekit":
         return LiveKitTelephonyGateway()
     if mode == "pipecat":

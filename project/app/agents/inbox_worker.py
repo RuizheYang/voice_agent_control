@@ -120,6 +120,7 @@ class InboxWakeupWorker:
     3. channel_inbox    (企微/短信渠道到达回执)
     4. approval_resumed (Deferred Tool Call 人工审批结果唤醒)
     5. memory_dream     (后台 LLM 语义级四桶记忆整理)
+    6. webhook_delivery (持久化 Webhook 异步投递与指数退避重试)
     """
 
     def __init__(
@@ -130,6 +131,7 @@ class InboxWakeupWorker:
             "channel_inbox",
             "approval_resumed",
             "memory_dream",
+            "webhook_delivery",
         ),
         lease_seconds: int = 60,
     ) -> None:
@@ -258,6 +260,42 @@ class InboxWakeupWorker:
         clue_id = task.clue_id
         token = task.lock_token
         try:
+            if task.task_type == "webhook_delivery":
+                from app.apis.webhook_dispatcher import _send_http_with_retry
+                from app.dbmodels.models import ExecutionTask
+                from app.utils.time_utils import get_now
+
+                payload = dict(task.payload or {})
+                event_id = payload.get("event_id") or task.event_id or ""
+                ok = await _send_http_with_retry(
+                    callback_url=payload["callback_url"],
+                    payload=payload.get("payload") or {},
+                    event=payload.get("event") or "",
+                    event_id=event_id,
+                    clue_id=payload.get("clue_id") or clue_id or "",
+                    max_retries=0,
+                )
+                if ok:
+                    if event_id:
+                        try:
+                            await ExecutionTask.filter(event_id=event_id, task_type="webhook").update(
+                                status="succeeded",
+                                finished_at=get_now(),
+                                last_error=None,
+                            )
+                        except Exception:
+                            pass
+                    await self._finish_task(task.id, token, succeeded=True, result_data={"delivered": True})
+                    return True
+
+                await self._finish_task(
+                    task.id,
+                    token,
+                    succeeded=False,
+                    error=RuntimeError("Webhook HTTP delivery failed"),
+                )
+                return False
+
             handler = await ClueHandlerFactory.get_handler_by_clue(clue_id)
 
             if task.task_type == "call_end_inbox":

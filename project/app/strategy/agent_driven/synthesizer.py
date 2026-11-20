@@ -89,6 +89,7 @@ class MasterDecisionSynthesizer:
             telephony_outcome=context_data.get("telephony_outcome", "unknown"),
             answered_str=context_data.get("answered_str", "未接通"),
             duration_seconds=context_data.get("duration_seconds", 0),
+            working_window=context_data.get("working_window") or f"{self.config.work_start_time} - {self.config.work_end_time}",
             memory_index=context_data.get("memory_index", "暂无历史记忆"),
             intent_analysis=json.dumps(
                 getattr(sub_outputs.get("intent"), "model_dump", lambda: {})(), ensure_ascii=False

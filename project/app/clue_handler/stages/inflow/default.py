@@ -62,6 +62,8 @@ class DefaultInflowHandler(BaseInflowHandler):
     ) -> bool:
         """非工作时间排期次呼：通过统一 schedule_call 安排到次日工作时间"""
         ctx = await ClueContext.from_db(clue.clueId)
+        if clue.workflowId and (not getattr(ctx, "workflow_id", None) or ctx.workflow_id == "default"):
+            ctx.workflow_id = clue.workflowId
         engine = await self.get_engine_for_clue(clue)
         strategy_result = await engine.calculate(ctx)
 

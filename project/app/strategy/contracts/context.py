@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import List, Any, Optional
+from typing import List, Any, Optional, Dict
 from pydantic import BaseModel, Field, model_validator, field_validator
 
 from app.dbmodels import crud
@@ -26,6 +26,9 @@ class ClueContext(BaseModel):
     continuous_no_answer_hours: int = 0  # 当前连续未接通小时数
     customer_date: Optional[datetime] = None  # 客户主动约定的外呼时间
     memory_index: Optional[str] = None  # 结构化四桶记忆紧凑索引 (Index-First 加载)
+    workflow_id: str = "default"  # 所属业务卡带 workflow_id，用于引擎正确加载业务卡带与工具集
+    coalesced_events: List[Any] = Field(default_factory=list)  # 同线索事件合并窗口到达的外部事件
+    strategy_followup: Dict[str, Any] = Field(default_factory=dict)  # 策略追呼配额参数 (maxCalls/maxNoAnswerCalls/maxFollowupHours)
 
     @property
     def first_call_no_answer(self) -> bool:
@@ -72,6 +75,19 @@ class ClueContext(BaseModel):
         clue_intake_time = await get_clue_intake_time(clue_id)
         raw_customer_date = customer_date
         db_call_count = await crud.get_total_call_count(clue_id)
+        clue = await crud.get_clue_info(clue_id)
+        workflow_id = clue.workflow_id if clue and getattr(clue, "workflow_id", None) else "default"
+        strategy_followup: Dict[str, Any] = {}
+        if clue and isinstance(getattr(clue, "clue_config", None), dict) and isinstance(clue.clue_config.get("followup"), dict):
+            strategy_followup = dict(clue.clue_config["followup"])
+        elif clue and getattr(clue, "strategy_id", None):
+            try:
+                from app.dbmodels.models import OutboundStrategy
+                st = await OutboundStrategy.filter(strategy_id=clue.strategy_id).first()
+                if st and isinstance(st.followup, dict):
+                    strategy_followup = dict(st.followup)
+            except Exception:
+                pass
 
         obj = cls(
             clue_id=clue_id,
@@ -79,6 +95,8 @@ class ClueContext(BaseModel):
             call_records=call_records,
             customer_date=raw_customer_date,
             total_call_count=db_call_count,
+            workflow_id=workflow_id,
+            strategy_followup=strategy_followup,
         )
 
         logger.info(

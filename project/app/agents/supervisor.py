@@ -12,6 +12,8 @@ from app.agents.contracts import (
     BusinessDomainPack,
     ClueStructuredMemory,
     SupervisorActionPlan,
+    WakeupEvaluationContext,
+    is_channel_success_event,
 )
 from app.agents.domain_registry import DomainPackRegistry, domain_pack_registry
 from app.agents.memory_dreamer import MemoryDreamer
@@ -160,21 +162,69 @@ class ClueSupervisorAgent:
 
     @staticmethod
     def _extract_tool_executions(result: Any) -> List[Dict[str, Any]]:
-        """从 PydanticAI RunResult 消息历史中提取工具调用审计记录"""
+        """从 PydanticAI RunResult 消息历史中提取工具调用与返回审计记录"""
         executions: List[Dict[str, Any]] = []
+        by_call_id: Dict[str, Dict[str, Any]] = {}
         try:
             for msg in result.new_messages():
                 for part in getattr(msg, "parts", []) or []:
                     part_kind = getattr(part, "part_kind", "")
                     if part_kind == "tool-call":
-                        executions.append({
+                        call_id = getattr(part, "tool_call_id", "")
+                        entry = {
                             "tool_name": getattr(part, "tool_name", ""),
                             "args": getattr(part, "args", None),
-                            "tool_call_id": getattr(part, "tool_call_id", ""),
-                        })
+                            "tool_call_id": call_id,
+                        }
+                        executions.append(entry)
+                        if call_id:
+                            by_call_id[call_id] = entry
+                    elif part_kind == "tool-return":
+                        call_id = getattr(part, "tool_call_id", "")
+                        if call_id and call_id in by_call_id:
+                            content = getattr(part, "content", None)
+                            by_call_id[call_id]["result"] = (
+                                content.model_dump(mode="json") if hasattr(content, "model_dump") else content
+                            )
         except Exception:
             pass
         return executions
+
+    async def _persist_deferred_approvals(
+        self,
+        clue_id: str,
+        workflow_id: str,
+        output: DeferredToolRequests,
+        *,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """将 DeferredToolRequests 中的高危工具调用请求持久化为 tool_approval 任务"""
+        approvals = getattr(output, "approvals", []) or []
+        first_req = approvals[0] if approvals else None
+        tool_name = getattr(first_req, "tool_name", "unknown_tool") if first_req else "unknown_tool"
+        tool_args = first_req.args_as_dict() if (first_req and hasattr(first_req, "args_as_dict")) else {}
+        approval_detail: Dict[str, Any] = {
+            "tool_name": tool_name,
+            "tool_args": tool_args,
+            "approval_count": len(approvals),
+            "approval_task_ids": [],
+        }
+        if not dry_run:
+            from app.agents.approvals import create_deferred_approval_task
+            for req in approvals:
+                req_name = getattr(req, "tool_name", "unknown_tool")
+                req_args = req.args_as_dict() if hasattr(req, "args_as_dict") else {}
+                approval_task = await create_deferred_approval_task(
+                    clue_id=clue_id,
+                    workflow_id=workflow_id,
+                    tool_name=req_name,
+                    tool_args=req_args,
+                    reason=f"Agent 请求调用高危工具 '{req_name}'，等待人工审批",
+                )
+                approval_detail["approval_task_ids"].append(approval_task.id)
+            if approval_detail["approval_task_ids"]:
+                approval_detail["approval_task_id"] = approval_detail["approval_task_ids"][0]
+        return approval_detail
 
     async def run_single_pass_postcall(
         self,
@@ -201,11 +251,17 @@ class ClueSupervisorAgent:
             dry_run=dry_run,
             coalesced_events=coalesced_events,
         )
+        from app.strategy.agent_driven.evaluators import build_single_pass_decision_model
+
+        decision_schema = build_single_pass_decision_model(
+            deps.domain_pack.workflow_id,
+            deps.domain_pack.custom_evaluators,
+        )
         toolset = build_domain_toolset(deps.domain_pack)
         output_spec: Any = (
-            [MasterSummaryDecision, DeferredToolRequests]
+            [decision_schema, DeferredToolRequests]
             if deps.domain_pack.approval_required_tools
-            else MasterSummaryDecision
+            else decision_schema
         )
         effective_timeout = timeout or self.timeout_seconds or 5.0
 
@@ -221,26 +277,10 @@ class ClueSupervisorAgent:
         output = result.output
 
         if isinstance(output, DeferredToolRequests):
-            approvals = getattr(output, "approvals", []) or []
-            first_req = approvals[0] if approvals else None
-            tool_name = getattr(first_req, "tool_name", "unknown_tool") if first_req else "unknown_tool"
-            tool_args = first_req.args_as_dict() if (first_req and hasattr(first_req, "args_as_dict")) else {}
-            approval_detail = {
-                "tool_name": tool_name,
-                "tool_args": tool_args,
-                "approval_count": len(approvals),
-            }
-            if not dry_run:
-                from app.agents.approvals import create_deferred_approval_task
-                approval_task = await create_deferred_approval_task(
-                    clue_id=clue_id,
-                    workflow_id=deps.domain_pack.workflow_id,
-                    tool_name=tool_name,
-                    tool_args=tool_args,
-                    reason=f"Agent 请求调用高危工具 '{tool_name}'，等待人工审批",
-                )
-                approval_detail["approval_task_id"] = approval_task.id
-
+            approval_detail = await self._persist_deferred_approvals(
+                clue_id, deps.domain_pack.workflow_id, output, dry_run=dry_run
+            )
+            tool_name = approval_detail["tool_name"]
             return MasterSummaryDecision(
                 status=StandardBusinessStatus.PARTIAL,
                 reason=f"高危工具 '{tool_name}' 已挂起等待人工审批 (Deferred Tool Call)",
@@ -249,8 +289,22 @@ class ClueSupervisorAgent:
                 tool_executions=self._extract_tool_executions(result),
             )
 
+        executions = self._extract_tool_executions(result)
+        if decision_schema is not MasterSummaryDecision:
+            raw_findings = getattr(output, "custom_evaluator_findings", None)
+            findings_dict = (
+                raw_findings.model_dump(exclude_none=True)
+                if hasattr(raw_findings, "model_dump")
+                else dict(raw_findings or {})
+            )
+            return MasterSummaryDecision.model_validate({
+                **output.model_dump(exclude={"custom_evaluator_findings", "tool_executions"}),
+                "custom_evaluator_findings": findings_dict,
+                "tool_executions": executions,
+            })
+
         decision: MasterSummaryDecision = output
-        decision.tool_executions = self._extract_tool_executions(result)
+        decision.tool_executions = executions
         return decision
 
     async def evaluate_wakeup(
@@ -263,24 +317,33 @@ class ClueSupervisorAgent:
         """
         Always-On 认知自唤醒执行器 (`agent_wakeup` / `approval_resumed` 共用):
         1. 先处理合并到达的硬事实事件（如企微通过通知 / 人工审批放行或驳回）；
-        2. 若仍处于非终态且配置了 LLM，则挂载 Guarded ToolBus 唤醒 Supervisor 进行自主决策；
-        3. 若无 LLM 或超时，执行确定性 Always-On 唤醒自检并沉淀四桶记忆。
+        2. 构造 WakeupEvaluationContext（当前状态、合并事件、四桶记忆、今日剩余配额）；
+        3. 若仍处于非终态且配置了 LLM，则挂载 Guarded ToolBus（含 DeferredToolRequests 门禁）唤醒自主决策；
+        4. 若无 LLM 或超时，执行确定性 Always-On 唤醒自检（补发短信并安排工作窗电话追呼）并沉淀四桶记忆。
         """
         from app.clue_handler.state import ClueState
         from app.dbmodels import crud
+        from app.dbmodels.models import ExecutionTask
         from app.observability.events_bus import ClueEndEvent, event_bus
+        from app.strategy.agent_driven.tools import snap_to_working_window
 
+        terminal_states = (ClueState.ACCEPTED.value, ClueState.REJECTED.value, "completed", "cancelled", "failed")
         events = list(coalesced_events or [])
         clue = await crud.get_clue_info(clue_id)
         if not clue:
             return {"handled": True, "outcome": "clue_not_found"}
 
-        if clue.status in (ClueState.ACCEPTED.value, ClueState.REJECTED.value, "completed", "cancelled", "failed"):
+        if clue.status in terminal_states:
             return {"handled": True, "outcome": "already_terminal", "status": clue.status}
 
-        # 1. 处理合并事件中的企微/渠道成功通知
+        # 1. 处理合并事件中的企微/渠道成功通知（兼容 success=True 与 data.resultCode=='3'）
         for ev in events:
-            if ev.get("type") == "channel_notify" and ev.get("success") is True:
+            if is_channel_success_event(ev):
+                await ExecutionTask.filter(
+                    clue_id=clue_id,
+                    task_type__in=["agent_wakeup", "call"],
+                    status__in=["pending", "retry"],
+                ).update(status="cancelled", last_error="cancelled_by_wakeup_channel_success")
                 await crud.update_clue_state_or_raise(clue_id, ClueState.ACCEPTED.value)
                 await crud.save_close_reason(clue_id, "渠道添加成功(合并事件唤醒收口)")
                 await MemoryDreamer.curate_and_persist(
@@ -295,7 +358,7 @@ class ClueSupervisorAgent:
                 ))
                 return {"handled": True, "outcome": "accepted_via_channel"}
 
-        # 2. 处理人工审批恢复事件 (approval_resumed)
+        # 2. 处理人工审批恢复事件 (approval_resumed)，并在执行工具后刷新线索状态
         approval_notes: List[str] = []
         for ev in events:
             if ev.get("type") == "approval_resumed":
@@ -313,22 +376,55 @@ class ClueSupervisorAgent:
                 else:
                     approval_notes.append(f"人工审批驳回 {tool_name}: {ev.get('comment', '')}")
 
-        # 3. 尝试挂载 ToolBus 唤醒 SupervisorAgent 自主思考与行动
+        if approval_notes:
+            refreshed = await crud.get_clue_info(clue_id)
+            if refreshed:
+                clue = refreshed
+            if clue.status in terminal_states:
+                await MemoryDreamer.curate_and_persist(
+                    clue_id,
+                    digest_entry=f"[审批恢复] {'; '.join(approval_notes)[:160]} -> 终态 {clue.status}",
+                    progress=f"approval_terminal:{clue.status}",
+                )
+                return {
+                    "handled": True,
+                    "outcome": f"approval_executed_terminal:{clue.status}",
+                    "status": clue.status,
+                }
+
+        # 3. 构造 WakeupEvaluationContext，挂载 ToolBus 唤醒 SupervisorAgent 自主思考与行动
         agent = self.get_stateless_agent()
         deps = await self.build_runtime_deps(
             clue_id,
             workflow_id=clue.workflow_id,
             coalesced_events=events,
         )
+        remaining_touches = max(0, deps.domain_pack.max_touches_per_24h - deps.recent_24h_touches)
+        wakeup_ctx = WakeupEvaluationContext(
+            clue_id=clue_id,
+            workflow_id=deps.domain_pack.workflow_id,
+            current_status=clue.status,
+            check_goal=check_goal or "检查线索当前进度并决定下一步跟进动作",
+            coalesced_events=events,
+            memory_index=deps.structured_memory.to_compact_index(),
+            recent_24h_touches=deps.recent_24h_touches,
+            max_touches_per_24h=deps.domain_pack.max_touches_per_24h,
+            remaining_touches_today=remaining_touches,
+            approval_notes=approval_notes,
+        )
         if agent is not None:
             try:
                 toolset = build_domain_toolset(deps.domain_pack)
+                output_spec: Any = (
+                    [SupervisorActionPlan, DeferredToolRequests]
+                    if deps.domain_pack.approval_required_tools
+                    else SupervisorActionPlan
+                )
                 wakeup_prompt = (
                     f"【认知唤醒定时自检 (Always-On Wakeup)】\n"
-                    f"当前线索状态: {clue.status}\n"
-                    f"自检目标 (check_goal): {check_goal or '检查线索当前进度并决定下一步跟进动作'}\n"
-                    f"人工审批执行反馈: {approval_notes or '无'}\n"
-                    f"请结合结构化记忆与近期事件，直接调用合适工具推进业务（如发短信、安排电话追呼、重设唤醒定时器或收口结案），"
+                    f"唤醒上下文 (WakeupEvaluationContext): {wakeup_ctx.model_dump_json(ensure_ascii=False)}\n"
+                    f"请结合结构化记忆、近期事件与剩余今日配额 ({wakeup_ctx.remaining_touches_today})，"
+                    f"直接调用合适工具推进业务（如发短信、安排电话追呼、重设唤醒定时器或收口结案），"
                     f"并输出 SupervisorActionPlan。"
                 )
                 res = await asyncio.wait_for(
@@ -336,10 +432,20 @@ class ClueSupervisorAgent:
                         wakeup_prompt,
                         deps=deps,
                         toolsets=[toolset],
-                        output_type=SupervisorActionPlan,
+                        output_type=output_spec,
                     ),
                     timeout=self.timeout_seconds,
                 )
+                if isinstance(res.output, DeferredToolRequests):
+                    approval_detail = await self._persist_deferred_approvals(
+                        clue_id, deps.domain_pack.workflow_id, res.output, dry_run=False
+                    )
+                    return {
+                        "handled": True,
+                        "outcome": "deferred_approval",
+                        "deferred_approval": approval_detail,
+                        "tools_called": len(self._extract_tool_executions(res)),
+                    }
                 plan: SupervisorActionPlan = res.output
                 await MemoryDreamer.curate_and_persist(
                     clue_id,
@@ -355,9 +461,10 @@ class ClueSupervisorAgent:
             except Exception as err:
                 logger.warning(f"[ClueSupervisor] 唤醒推理降级为确定性检查 (clue_id={clue_id}): {err}")
 
-        # 4. 确定性唤醒兜底：若处于 PENDING 仍未加微且未超 24h 频控，补发短信提醒或沉淀进度
+        # 4. 确定性唤醒兜底：若处于 PENDING 仍未通过且今日触达配额充足，补发短信提醒并安排合法工时窗回访
         fallback_action = "memory_recorded"
-        if clue.status == ClueState.PENDING.value and deps.recent_24h_touches < deps.domain_pack.max_touches_per_24h:
+        if clue.status == ClueState.PENDING.value and wakeup_ctx.remaining_touches_today > 0:
+            sms_dispatched = False
             try:
                 from app.apis.webhook_dispatcher import dispatch_webhook_event
                 await dispatch_webhook_event(
@@ -366,11 +473,35 @@ class ClueSupervisorAgent:
                     workflow_id=clue.workflow_id,
                     data={"channel": "sms", "message_hint": f"唤醒自检补发提醒: {check_goal}"},
                 )
+                sms_dispatched = True
                 fallback_action = "sms_followup_dispatched"
             except Exception:
                 pass
+
+            if "tool_schedule_followup" in (deps.domain_pack.allowed_tools or []):
+                try:
+                    has_pending_call = await ExecutionTask.filter(
+                        clue_id=clue_id,
+                        task_type="call",
+                        status__in=["pending", "retry"],
+                    ).exists()
+                    if not has_pending_call:
+                        from app.call_schedule.service import schedule_call
+
+                        target_dt = snap_to_working_window(
+                            get_now() + timedelta(hours=3),
+                            deps.domain_pack.work_start_time,
+                            deps.domain_pack.work_end_time,
+                        )
+                        await crud.update_clue_state_or_raise(clue_id, ClueState.SCHEDULED.value)
+                        await schedule_call(clue_id, target_dt, priority=5)
+                        fallback_action = (
+                            "sms_and_followup_scheduled" if sms_dispatched else "followup_scheduled"
+                        )
+                except Exception as sched_err:
+                    logger.debug(f"[ClueSupervisor] 唤醒兜底安排回访跳过: {sched_err}")
         elif clue.status == ClueState.AWAITING_APPROVAL.value and approval_notes:
-            # 审批结束后若仍停留在 AWAITING_APPROVAL，安全恢复至 SCHEDULED 以便后续推进
+            # 审批驳回或执行非终态工具后若仍停留在 AWAITING_APPROVAL，安全恢复至 SCHEDULED 以便后续推进
             try:
                 await crud.update_clue_state_or_raise(clue_id, ClueState.SCHEDULED.value)
                 fallback_action = "restored_to_scheduled_after_approval"

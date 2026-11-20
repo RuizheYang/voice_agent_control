@@ -76,7 +76,7 @@ MASTER_SYNTHESIZER_SYSTEM_PROMPT = """你是一位资深的高级外呼策略决
 - 线索总呼叫次数：{total_calls} 次 (今日已呼：{today_calls} 次)
 - 连续未接通次数：{continuous_no_answer} 次
 - 物理通话结果：{telephony_outcome} (接通状态：{answered_str}, 通话时长：{duration_seconds} 秒)
-- 允许合法工时窗口：09:00:00 - 21:00:00
+- 允许合法工时窗口：{working_window}
 - 线索长期结构化记忆索引：{memory_index}
 
 【各垂直业务专家分析结论】：
