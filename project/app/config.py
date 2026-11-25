@@ -1,3 +1,6 @@
+"""Clean V3 RSI platform configuration loader."""
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -7,7 +10,7 @@ from typing import List
 
 
 def _mask_dsn(url: str) -> str:
-    """脱敏数据库/Redis连接字符串中的密码，防止启动日志泄露凭证"""
+    """Mask database/Redis credentials in startup logs."""
     if not url:
         return ""
     return re.sub(r"://([^:/?#]+):([^@]+)@", r"://\1:***@", url)
@@ -15,7 +18,8 @@ def _mask_dsn(url: str) -> str:
 
 @dataclass
 class RedisConfig:
-    """Redis 连接配置"""
+    """Optional Redis connection pool settings."""
+
     cluster_mode: bool
     redis_url: str
     cluster_nodes: List[str]
@@ -27,10 +31,14 @@ class RedisConfig:
     max_connections: int
 
     @classmethod
-    def from_config(cls, config_dict: dict):
+    def from_config(cls, config_dict: dict) -> "RedisConfig":
         data = config_dict.get("redis", {})
         cluster_nodes_env = os.getenv("REDIS_CLUSTER_NODES", "")
-        env_nodes = [n.strip() for n in cluster_nodes_env.split(",") if n.strip()] if cluster_nodes_env else None
+        env_nodes = (
+            [n.strip() for n in cluster_nodes_env.split(",") if n.strip()]
+            if cluster_nodes_env
+            else None
+        )
         cluster_mode_env = os.getenv("REDIS_CLUSTER_MODE")
         cluster_mode = (
             cluster_mode_env.lower() == "true"
@@ -39,7 +47,9 @@ class RedisConfig:
         )
         return cls(
             cluster_mode=cluster_mode,
-            redis_url=os.getenv("REDIS_URL", data.get("redis_url", "redis://localhost:6379/0")),
+            redis_url=os.getenv(
+                "REDIS_URL", data.get("redis_url", "redis://localhost:6379/0")
+            ),
             cluster_nodes=env_nodes if env_nodes is not None else data.get("cluster_nodes", []),
             password=os.getenv("REDIS_PASSWORD", data.get("password", "")),
             decode_responses=data.get("decode_responses", True),
@@ -52,35 +62,32 @@ class RedisConfig:
 
 @dataclass
 class SecurityConfig:
-    """字段级 AES-GCM 加解密配置（支持 16/24/32 字节密钥或 Base64 编码）"""
+    """Field-level AES-GCM encryption settings."""
+
     version_label: str
     encryption_key: str
     search_salt: str
 
     @classmethod
-    def from_config(cls, config_dict: dict):
+    def from_config(cls, config_dict: dict) -> "SecurityConfig":
         data = config_dict.get("security_config", {})
         return cls(
-            version_label=os.getenv("APP_ENCRYPTION_VERSION", data.get("version_label", "V1")),
-            encryption_key=os.getenv("APP_ENCRYPTION_KEY", data.get("encryption_key", "")),
-            search_salt=os.getenv("APP_SEARCH_SALT", data.get("search_salt", "voice-agent-hub-salt")),
+            version_label=os.getenv(
+                "APP_ENCRYPTION_VERSION", data.get("version_label", "V1")
+            ),
+            encryption_key=os.getenv(
+                "APP_ENCRYPTION_KEY", data.get("encryption_key", "")
+            ),
+            search_salt=os.getenv(
+                "APP_SEARCH_SALT", data.get("search_salt", "voice-agent-hub-salt")
+            ),
         )
-
-
-LOGO = r"""
- █████╗  ██████╗ ███████╗███╗   ██╗████████╗██╗ ██████╗
-██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝██║██╔════╝
-███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║   ██║██║     
-██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║   ██║██║     
-██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║   ██║╚██████╗
-╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚═╝ ╚═════╝
-       V O I C E   A G E N T   C O N T R O L
-"""
 
 
 @dataclass
 class LLMFactoryConfig:
-    """OpenAI 兼容大模型服务配置"""
+    """OpenAI-compatible LLM & VLM provider configuration."""
+
     base_url: str
     api_key: str
     headers: dict
@@ -92,7 +99,7 @@ class LLMFactoryConfig:
         return self.api_key
 
     @classmethod
-    def from_config(cls, config_dict: dict):
+    def from_config(cls, config_dict: dict) -> "LLMFactoryConfig":
         env_model = os.getenv("LLM_MODEL_NAME", "")
         env_base_url = os.getenv("LLM_BASE_URL", "")
         env_api_key = os.getenv("LLM_API_KEY", "")
@@ -122,41 +129,35 @@ class LLMFactoryConfig:
 
 
 @dataclass
-class WechatAddedNoticeConfig:
-    """可选下游渠道动作通知接口配置"""
-    url: str
-    token: str
-    app_id: str
-
-    @classmethod
-    def from_config(cls, config_dict: dict):
-        data = config_dict.get("channel_notice") or config_dict.get("wechat_added_notice") or {}
-        return cls(
-            url=os.getenv("WECHAT_NOTICE_URL", data.get("url", "")),
-            token=os.getenv("WECHAT_NOTICE_TOKEN", data.get("token", "")),
-            app_id=os.getenv("WECHAT_NOTICE_APP_ID", data.get("app_id", "")),
-        )
-
-
-@dataclass
 class CallRequestConfig:
-    """外呼网关适配配置（支持 mock 沙箱与通用 HTTP Webhook 网关）"""
-    gateway_mode: str = "mock"  # mock | webhook
+    """Edge voice telephony gateway settings (mock / http_webhook / livekit / pipecat)."""
+
+    gateway_mode: str = "mock"
     call_request_url: str = ""
     send_phone_status_url: str = ""
     cancel_url: str = ""
 
     @classmethod
-    def from_config(cls, data: dict, env: str):
+    def from_config(cls, data: dict) -> "CallRequestConfig":
         telephony_section = data.get("telephony") or data.get("call_request_config") or {}
-        send_url = os.getenv("TELEPHONY_SEND_URL", telephony_section.get("call_request_url", ""))
-        status_url = os.getenv("TELEPHONY_STATUS_URL", telephony_section.get("send_phone_status_url", ""))
-        cancel_url = os.getenv("TELEPHONY_CANCEL_URL", telephony_section.get("cancel_url", ""))
+        send_url = os.getenv(
+            "TELEPHONY_SEND_URL", telephony_section.get("call_request_url", "")
+        )
+        status_url = os.getenv(
+            "TELEPHONY_STATUS_URL", telephony_section.get("send_phone_status_url", "")
+        )
+        cancel_url = os.getenv(
+            "TELEPHONY_CANCEL_URL", telephony_section.get("cancel_url", "")
+        )
         default_mode = "webhook" if send_url else "mock"
-        gateway_mode = os.getenv(
-            "TELEPHONY_GATEWAY_MODE",
-            telephony_section.get("gateway_mode", default_mode),
-        ).strip().lower()
+        gateway_mode = (
+            os.getenv(
+                "TELEPHONY_GATEWAY_MODE",
+                telephony_section.get("gateway_mode", default_mode),
+            )
+            .strip()
+            .lower()
+        )
         return cls(
             gateway_mode=gateway_mode,
             call_request_url=send_url,
@@ -165,50 +166,26 @@ class CallRequestConfig:
         )
 
 
-@dataclass(frozen=True)
-class CallScheduleSettings:
-    workers: int = 2
-    lease_seconds: int = 180
-    http_timeout_seconds: int = 15
-    dispatch_interval_ms: int = 1000
-    reconcile_seconds: int = 15
-    pause_delay_seconds: int = 5
-
-    @classmethod
-    def from_env(cls):
-        values = {}
-        for name in cls.__dataclass_fields__:
-            value = int(os.getenv(f"CALL_SCHEDULE_{name.upper()}", str(getattr(cls, name))))
-            if value < 1:
-                raise ValueError(f"CALL_SCHEDULE_{name.upper()} must be positive")
-            values[name] = value
-        if values["lease_seconds"] <= 3 * values["http_timeout_seconds"] + 30:
-            raise ValueError("call lease must exceed three HTTP timeouts plus 30 seconds")
-        return cls(**values)
-
-
 @dataclass
 class Config:
-    voice_agent_report_url: str
+    """Minimal, domain-agnostic RSI V3 runtime configuration."""
+
+    database_url: str
     redis_config: RedisConfig
-    mysql_url: str
-    redis_queue_name: str
-    event_queue_name: str
     security_config: SecurityConfig
     llm_factory_config: LLMFactoryConfig
-    access_system_url: str = ""
-    message_reminder_url: str = ""
-    wechat_added_notice_config: WechatAddedNoticeConfig = field(
-        default_factory=lambda: WechatAddedNoticeConfig("", "", "")
-    )
-    bypass_call: bool = True
     call_request_config: CallRequestConfig = field(default_factory=CallRequestConfig)
-    voice_agent_cancel_url: str = ""
+    bypass_call: bool = True
+
+    @property
+    def mysql_url(self) -> str:
+        """Backward-compatible property alias for database_url."""
+        return self.database_url
 
     @classmethod
     def _load_json_dict(cls, env: str) -> dict:
         explicit = os.getenv("CONFIG_FILE", "").strip()
-        candidates = []
+        candidates: List[Path] = []
         if explicit:
             candidates.append(Path(explicit))
         cfg_dir = Path(__file__).parent / "configs"
@@ -220,51 +197,45 @@ class Config:
         return {}
 
     @classmethod
-    def from_config(cls):
+    def from_config(cls) -> "Config":
         env = os.getenv("ENV", "dev").strip() or "dev"
         config_dict = cls._load_json_dict(env.lower())
         telephony_section = config_dict.get("telephony", {})
-        call_req_cfg = CallRequestConfig.from_config(config_dict, env.lower())
+        call_req_cfg = CallRequestConfig.from_config(config_dict)
 
         default_db = "sqlite://dbfiles/voice_agent_hub.db"
         db_url = os.getenv(
             "DATABASE_URL",
-            os.getenv("MYSQL_URL", config_dict.get("database_url") or config_dict.get("mysql_url") or default_db),
+            os.getenv(
+                "MYSQL_URL",
+                config_dict.get("database_url")
+                or config_dict.get("mysql_url")
+                or default_db,
+            ),
         )
         bypass_env = os.getenv("BYPASS_CALL")
         if bypass_env is not None:
             bypass_call = bypass_env.lower() == "true"
         else:
             bypass_call = bool(
-                telephony_section.get("bypass_call", config_dict.get("bypass_call", call_req_cfg.gateway_mode == "mock"))
+                telephony_section.get(
+                    "bypass_call",
+                    config_dict.get("bypass_call", call_req_cfg.gateway_mode == "mock"),
+                )
             )
 
         res = cls(
-            call_request_config=call_req_cfg,
-            voice_agent_report_url=os.getenv("VOICE_AGENT_REPORT_URL", config_dict.get("voice_agent_report_url", "")),
-            access_system_url=os.getenv("ACCESS_SYSTEM_URL", config_dict.get("access_system_url", "")),
+            database_url=db_url,
             redis_config=RedisConfig.from_config(config_dict),
-            mysql_url=db_url,
-            message_reminder_url=os.getenv("MESSAGE_REMINDER_URL", config_dict.get("message_reminder_url", "")),
-            redis_queue_name=os.getenv("REDIS_QUEUE_NAME", config_dict.get("redis_queue_name", "voice_agent_hub")),
-            event_queue_name=os.getenv("EVENT_QUEUE_NAME", config_dict.get("event_queue_name", "voice_agent_hub_events")),
             security_config=SecurityConfig.from_config(config_dict),
             llm_factory_config=LLMFactoryConfig.from_config(config_dict),
-            wechat_added_notice_config=WechatAddedNoticeConfig.from_config(config_dict),
+            call_request_config=call_req_cfg,
             bypass_call=bypass_call,
-            voice_agent_cancel_url=call_req_cfg.cancel_url,
         )
 
-        print("\033[96m" + LOGO + "\033[0m")
-        print("\033[93m🚀 Agentic Voice Control Platform Configuration Loaded\033[0m\n")
-        print(f"🌍 Environment:             {env.upper()}")
-        print(f"📞 Telephony Gateway Mode:  {res.call_request_config.gateway_mode} (bypass={res.bypass_call})")
-        print(f"🗃️  Database DSN:            {_mask_dsn(res.mysql_url)}")
-        print(f"🔴 Redis URL:               {_mask_dsn(res.redis_config.redis_url)}")
-        print(f"🧠 LLM Model:               {res.llm_factory_config.model_name}")
-        print("-" * 70 + "\n")
+        print(f"[RSI V3] env={env.upper()} db={_mask_dsn(res.database_url)} "
+              f"voice_mode={res.call_request_config.gateway_mode} model={res.llm_factory_config.model_name}")
         return res
 
 
-call_schedule_settings = CallScheduleSettings.from_env()
 config = Config.from_config()

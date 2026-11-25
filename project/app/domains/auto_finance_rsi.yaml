@@ -1,0 +1,172 @@
+# Auto Finance RSI V3 Domain Plugin Pack (Zero-Kernel-Change Demonstration)
+domain_id: auto_finance
+domain_name: 汽车金融长程跟进闭环插件包
+policy_id: auto_finance_v1
+version: "1.0"
+
+policy_config:
+  working_window:
+    work_start_time: "09:00:00"
+    work_end_time: "21:00:00"
+    timezone: "Asia/Shanghai"
+  morning_buffer_minutes: 30
+  window_enforced_channels: ["voice", "sms"]
+  wakeup_on_wechat_added: true
+  enable_pre_call_sms: true
+  wechat_debounce_ms: 0
+  max_touches_24h: 20
+  max_touches_7d: 50
+  city_caller_map:
+    杭州:
+      caller_number: "0571-88886666"
+      line_id: "hz_auto_01"
+    上海:
+      caller_number: "021-66668888"
+      line_id: "sh_auto_01"
+    北京:
+      caller_number: "010-88889999"
+      line_id: "bj_auto_01"
+
+global_qa_topics:
+  - topic_id: pledge_certificate
+    priority: 5
+    keywords: ["押证", "绿本", "押车", "扣车", "装GPS"]
+    answer_template: "我们是正规押证不押车方案：仅需办理车辆登记证（绿本）抵押登记，车辆依然由您正常日常使用，不影响开车。"
+    resume_prompt: "政策已为您解答，咱们继续刚才这一步～"
+  - topic_id: interest_rate
+    priority: 10
+    keywords: ["费率", "利息", "利率", "月息", "年化"]
+    answer_template: "具体年化费率会根据车辆残值评估结果和您的分期期数透明核算，签约前会提供完整还款计划表，绝无隐形收费。"
+    resume_prompt: "费率方面您清楚了吗？我们继续刚才的进度～"
+  - topic_id: remote_plate_policy
+    priority: 15
+    keywords: ["异地", "外地牌", "外地车", "户籍"]
+    answer_template: "支持全国主流城市牌照车辆办理（含异地牌照），不限制户籍所在地，只需车主本人配合线上核验即可。"
+    resume_prompt: "异地牌照政策支持办理的，我们继续刚才的步骤～"
+  - topic_id: early_repayment
+    priority: 20
+    keywords: ["提前还款", "违约金"]
+    answer_template: "支持提前结清，具体违约金减免条款以合作金融机构合同为准，满一定期数后通常支持灵活提前还款。"
+    resume_prompt: "提前还款说明清楚后，咱们继续刚才那一步～"
+
+mcp_servers:
+  - server_id: auto_finance_quote_mcp
+    transport: streamable_http
+    url: "https://mcp.autofinance.internal/quote"
+    auth_ref: auto_finance_mcp_key
+    enabled: true
+
+http_tools:
+  - name: calculate_auto_loan_quote
+    description: Call enterprise auto-finance appraisal quote API to estimate max loan limit and monthly rate
+    method: POST
+    url: "https://api.autofinance.internal/v1/quote/estimate"
+    auth_ref: auto_finance_api_key
+    auth_header_name: Authorization
+    auth_scheme: Bearer
+    timeout_seconds: 10.0
+    params:
+      - name: vin
+        type: str
+        required: true
+        description: 17-character standardized VIN code
+      - name: car_age_years
+        type: float
+        required: true
+        description: Calculated car age in years
+      - name: mileage_wan_km
+        type: float
+        required: true
+        description: Vehicle mileage in 10,000 km units
+      - name: loan_term_months
+        type: int
+        required: true
+        description: Desired repayment term in months
+
+subflows:
+  auto_qual_precheck:
+    subflow_id: auto_qual_precheck
+    description: 汽车金融资质初审（城市/车主身份/期望额度）
+    initial_node_id: collect_qualification
+    nodes:
+      collect_qualification:
+        prompt: "引导客户确认办理城市(city)、是否本人名下车辆(is_owner)、期望融资额度万元数(desired_amount_wan)。信息未收齐前禁止跳转。"
+        fixed_opening: "您好！我是您的汽车金融专属顾问，很高兴微信上为您服务～先简单核对一下初审信息：请问您车辆目前在哪个城市、登记在本人名下吗？大概期望额度多少万呢？"
+        resume_hint: "您补充一下城市、是否本人车辆和期望额度（万元）即可哦～"
+        output_fields:
+          - name: city
+            type: str
+            required: true
+            description: 办理所在城市
+          - name: is_owner
+            type: bool
+            required: true
+            description: 是否登记在申请人本人名下
+          - name: desired_amount_wan
+            type: int
+            required: true
+            ge: 1
+            description: 期望借款额度（万元）
+        completion_reply: "太好了，您的资质初审信息已全部确认！接下来需要您发一下车辆行驶证正本清晰照片，我帮您即时核算车架号和准入车龄。"
+
+  auto_vehicle_license_precheck:
+    subflow_id: auto_vehicle_license_precheck
+    description: 行驶证多模态预审（Qwen3-VL-32B / OCR 识别 VIN 码、17 位校验、核算车龄与预审码下发）
+    handler_type: python_multimodal
+    initial_node_id: collect_license_image
+    max_car_age_years: 10.0
+    fixed_opening: "收到！请拍一张清晰的《机动车行驶证》主页照片发给我，我这边用多模态引擎帮您自动识别车架号 VIN 和注册日期并生成预审码。"
+    resume_hint: "麻烦发一下清晰的行驶证主页照片，或直接告诉我完整17位车架号VIN与首次注册日期～"
+
+  auto_vehicle_submission:
+    subflow_id: auto_vehicle_submission
+    description: 车辆提报与智能额度试算（公里数/分期期数 -> 调用外部试算工具）
+    initial_node_id: collect_vehicle_details
+    nodes:
+      collect_vehicle_details:
+        prompt: "根据客户已有的 VIN 与车龄，收集当前表显公里数(万公里 mileage_wan_km)与期望分期期数(loan_term_months)，必须先调用 calculate_auto_loan_quote 工具获取测算结果，再严格返回结构化提报输出。"
+        fixed_opening: "行驶证预审通过啦！现在进入车辆提报环节，请问车子目前表显行驶了多少万公里？您倾向分多少期（比如24期/36期）呢？"
+        resume_hint: "请告诉我爱车目前行驶了多少万公里，以及打算分多少期哦～"
+        tools: ["calculate_auto_loan_quote"]
+        output_fields:
+          - name: mileage_wan_km
+            type: float
+            required: true
+            ge: 0
+            description: 车辆当前里程（万公里）
+          - name: loan_term_months
+            type: int
+            required: true
+            ge: 6
+            description: 申请分期期数（月）
+          - name: estimated_limit_wan
+            type: int
+            required: true
+            ge: 1
+            description: 试算预估可贷额度（万元）
+        completion_reply: "车辆提报与额度试算已完成！接下来我们为您安排线下精评师对接核验。"
+
+  auto_detailed_appraisal:
+    subflow_id: auto_detailed_appraisal
+    description: 车辆精评预约（预约日期/到店或上门模式/城市确认）
+    initial_node_id: schedule_appraisal
+    nodes:
+      schedule_appraisal:
+        prompt: "与客户敲定车辆精评预约日期(appraisal_date)、精评方式(appraisal_mode: store 或 onsite)及预约城市(appraisal_city)。"
+        fixed_opening: "现在进入最后一步精评预约啦！请问您方便安排哪一天做车况精评？希望到附近评估网点（store）还是评估师免费上门（onsite）呢？"
+        resume_hint: "请确认一下方便精评的日期、城市，以及到店还是上门评估～"
+        output_fields:
+          - name: appraisal_date
+            type: str
+            required: true
+            description: 预约精评日期 YYYY-MM-DD
+          - name: appraisal_mode
+            type: str
+            enum: ["store", "onsite"]
+            required: true
+            description: 到店精评或上门精评
+          - name: appraisal_city
+            type: str
+            required: true
+            description: 精评城市
+        completion_reply: "太棒了！您的车辆精评档期已正式锁定，评估完成后即可为您出具终审放款方案。"
